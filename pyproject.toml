@@ -1,0 +1,28 @@
+[project]
+name = "self-checkout-ml"
+version = "0.1.0"
+description = "ML snapshot storage API for self-checkout sessions"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "fastapi[standard]<1.0.0,>=0.114.2",
+    "python-multipart<1.0.0,>=0.0.7",
+    "pydantic>2.0",
+    "pydantic-settings<3.0.0,>=2.2.1",
+    "minio<8.0.0,>=7.2.15",
+    "opencv-python-headless<5.0.0,>=4.10.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff<1.0.0,>=0.2.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+target-version = "py310"
