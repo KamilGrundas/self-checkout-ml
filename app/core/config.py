@@ -31,7 +31,23 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_PUBLIC_URL: str = "http://localhost:9000"
     MINIO_USE_SSL: bool = False
-    ML_MINIO_BUCKET_NAME: str = "session-images"
+    ML_MINIO_SHELF_BUCKET_NAME: str = "session-images"
+    ML_MINIO_SCALE_BUCKET_NAME: str = "scale-images"
+    ML_MINIO_EXTERNAL_BUCKET_NAME: str = "uploaded-images"
+    ML_MINIO_TRAINING_BUCKET_NAME: str = "training-data"
+    ML_MINIO_LABELSTUDIO_EXPORT_BUCKET_NAME: str = "labelstudio-exports"
+    MLFLOW_TRACKING_URI: str = "http://127.0.0.1:5002"
+    MLFLOW_EXPERIMENT_NAME: str = "self-checkout-classifier"
+    MLFLOW_REGISTERED_MODEL_NAME: str = "self-checkout-classifier"
+    MLFLOW_SHELF_EXPERIMENT_NAME: str = "self-checkout-shelf-classifier"
+    MLFLOW_SHELF_MODEL_NAME: str = "self-checkout-shelf-classifier"
+    MODEL_CACHE_DIR: str = ".cache/model_store"
+    LABEL_STUDIO_URL: str = "http://127.0.0.1:8080"
+    LABEL_STUDIO_API_KEY: str = ""
+    LABEL_STUDIO_LABELS: str = ""
+    LABEL_STUDIO_SCALE_PROJECT_TITLE: str = "scale-products"
+    LABEL_STUDIO_SHELF_PROJECT_TITLE: str = "shelf-products"
+    LABEL_STUDIO_EXTERNAL_PROJECT_TITLE: str = "external-products"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
