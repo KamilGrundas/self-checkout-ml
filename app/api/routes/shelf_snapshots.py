@@ -1,3 +1,5 @@
+from urllib.parse import unquote
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.core.config import settings
@@ -10,11 +12,11 @@ from app.core.object_storage import (
 )
 from app.schemas import SessionSnapshotListPublic, SessionSnapshotPublic
 
-router = APIRouter(prefix="/checkout-sessions", tags=["session-snapshots"])
+router = APIRouter(prefix="/checkout-sessions", tags=["shelf-snapshots"])
 
 
-@router.post("/{session_id}/snapshots", response_model=SessionSnapshotPublic)
-async def upload_session_snapshot(
+@router.post("/{session_id}/shelf-snapshots", response_model=SessionSnapshotPublic)
+async def upload_shelf_snapshot(
     session_id: str,
     capture_index: int = Form(..., ge=0),
     product_id: str | None = Form(default=None),
@@ -36,6 +38,7 @@ async def upload_session_snapshot(
         filename=file.filename,
         content_type=file.content_type,
         data=data,
+        bucket_name=settings.ML_MINIO_SHELF_BUCKET_NAME,
     )
 
     return SessionSnapshotPublic(
@@ -45,21 +48,21 @@ async def upload_session_snapshot(
         product_name=product_name,
         filename=filename,
         object_name=object_name,
-        image_url=public_object_url(object_name),
+        image_url=public_object_url(object_name, settings.ML_MINIO_SHELF_BUCKET_NAME),
         content_type=file.content_type,
         size=len(data),
     )
 
 
-@router.get("/{session_id}/snapshots", response_model=SessionSnapshotListPublic)
-def list_session_snapshots(session_id: str) -> SessionSnapshotListPublic:
-    ensure_bucket_exists()
+@router.get("/{session_id}/shelf-snapshots", response_model=SessionSnapshotListPublic)
+def list_shelf_snapshots(session_id: str) -> SessionSnapshotListPublic:
+    ensure_bucket_exists(settings.ML_MINIO_SHELF_BUCKET_NAME)
     client = get_minio_client()
     prefix = build_object_name(session_id, "")
     snapshots: list[SessionSnapshotPublic] = []
 
     for obj in client.list_objects(
-        settings.ML_MINIO_BUCKET_NAME, prefix=prefix, recursive=True
+        settings.ML_MINIO_SHELF_BUCKET_NAME, prefix=prefix, recursive=True
     ):
         filename = obj.object_name.rsplit("/", 1)[-1]
         capture_prefix = filename.split("-", 1)[0]
@@ -68,10 +71,10 @@ def list_session_snapshots(session_id: str) -> SessionSnapshotListPublic:
 
         capture_index = int(capture_prefix)
         content_type = obj.content_type or "application/octet-stream"
-        stat = client.stat_object(settings.ML_MINIO_BUCKET_NAME, obj.object_name)
+        stat = client.stat_object(settings.ML_MINIO_SHELF_BUCKET_NAME, obj.object_name)
         metadata = stat.metadata or {}
-        product_id = metadata.get("x-amz-meta-product-id") or None
-        product_name = metadata.get("x-amz-meta-product-name") or None
+        product_id = unquote(metadata.get("x-amz-meta-product-id") or "") or None
+        product_name = unquote(metadata.get("x-amz-meta-product-name") or "") or None
 
         snapshots.append(
             SessionSnapshotPublic(
@@ -81,7 +84,9 @@ def list_session_snapshots(session_id: str) -> SessionSnapshotListPublic:
                 product_name=product_name,
                 filename=filename,
                 object_name=obj.object_name,
-                image_url=public_object_url(obj.object_name),
+                image_url=public_object_url(
+                    obj.object_name, settings.ML_MINIO_SHELF_BUCKET_NAME
+                ),
                 content_type=content_type,
                 size=obj.size,
             )

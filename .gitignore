@@ -1,6 +1,7 @@
 .env
 .venv/
+.uv-cache/
+.cache/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-data/
