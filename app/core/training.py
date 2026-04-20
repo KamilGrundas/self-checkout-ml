@@ -1,8 +1,10 @@
-"""Train a Keras image classifier from YOLO datasets stored in MinIO."""
+"""Train a Keras image classifier from YOLO and CSV datasets stored in MinIO."""
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import logging
 import tempfile
 from pathlib import Path
@@ -118,6 +120,118 @@ def _load_yolo_dataset(
     return loaded_images, loaded_labels, class_names
 
 
+def _download_csv_datasets(prefixes: list[str], dest: Path) -> None:
+    from app.core.object_storage import get_minio_client
+
+    client = get_minio_client()
+    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    images_dir = dest / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    all_rows: list[tuple[str, str]] = []
+
+    for idx, prefix in enumerate(prefixes):
+        prefix = prefix.rstrip("/") + "/"
+        csv_data: str | None = None
+        image_objects: dict[str, str] = {}  # filename -> object_name
+
+        for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+            rel = obj.object_name[len(prefix) :]
+            if rel == "dataset.csv":
+                csv_data = (
+                    client.get_object(bucket, obj.object_name).read().decode("utf-8")
+                )
+            elif rel.startswith("images/"):
+                image_objects[Path(rel).name] = obj.object_name
+
+        if csv_data is None:
+            logger.warning("No dataset.csv in prefix %s, skipping", prefix)
+            continue
+
+        for row in csv.DictReader(io.StringIO(csv_data)):
+            filename = row.get("filename", "")
+            label = row.get("label", "")
+            if not filename or not label:
+                continue
+            unique_name = f"{idx}_{filename}"
+            if filename in image_objects:
+                dest_path = images_dir / unique_name
+                if not dest_path.exists():
+                    client.fget_object(bucket, image_objects[filename], str(dest_path))
+                all_rows.append((unique_name, label))
+
+    with (dest / "dataset.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "label"])
+        writer.writerows(all_rows)
+
+
+def _load_csv_dataset(
+    dataset_dir: Path,
+    image_size: int,
+) -> tuple[list, list, list[str]]:
+    import cv2
+    import numpy as np
+
+    csv_path = dataset_dir / "dataset.csv"
+    if not csv_path.exists():
+        return [], [], []
+
+    images_dir = dataset_dir / "images"
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    class_names = sorted({row["label"] for row in rows if row.get("label")})
+    if not class_names:
+        return [], [], []
+    class_to_idx = {name: i for i, name in enumerate(class_names)}
+
+    loaded_images = []
+    loaded_labels = []
+
+    for row in rows:
+        filename = row.get("filename", "")
+        label = row.get("label", "")
+        if not filename or label not in class_to_idx:
+            continue
+        img_path = images_dir / filename
+        if not img_path.exists():
+            continue
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(
+            rgb, (image_size, image_size), interpolation=cv2.INTER_AREA
+        )
+        loaded_images.append(resized.astype(np.float32) / 255.0)
+        loaded_labels.append(class_to_idx[label])
+
+    return loaded_images, loaded_labels, class_names
+
+
+def _merge_datasets(
+    *groups: tuple[list, list, list[str]],
+) -> tuple[list, list, list[str]]:
+    """Merge multiple (images, labels, class_names) groups into a unified dataset."""
+    import numpy as np
+
+    all_classes = sorted({name for _, _, names in groups for name in names})
+    if not all_classes:
+        return [], [], []
+    class_to_idx = {name: i for i, name in enumerate(all_classes)}
+
+    merged_images: list = []
+    merged_labels: list = []
+
+    for images, labels, class_names in groups:
+        old_to_new = {i: class_to_idx[name] for i, name in enumerate(class_names)}
+        merged_images.extend(images)
+        merged_labels.extend(old_to_new[lbl] for lbl in labels)
+
+    return merged_images, np.array(merged_labels, dtype=np.int32).tolist(), all_classes
+
+
 def _split_data(images: list, labels: list, val_ratio: float) -> tuple:
     import numpy as np
 
@@ -182,14 +296,17 @@ def check_mlflow() -> None:
 
 
 def train_classifier(
-    datasets: list[str],
+    yolo_datasets: list[str],
+    csv_datasets: list[str] | None = None,
     *,
     image_size: int = 160,
     epochs: int = 12,
     batch_size: int = 16,
     validation_ratio: float = 0.2,
 ) -> dict:
-    """Train a classifier from YOLO datasets in MinIO and register in MLflow."""
+    """Train a classifier from YOLO datasets (crops) and/or CSV datasets (whole images)
+    stored in MinIO and register the result in MLflow.
+    """
     import os
 
     import numpy as np
@@ -208,9 +325,22 @@ def train_classifier(
     model_name = settings.MLFLOW_REGISTERED_MODEL_NAME
 
     with tempfile.TemporaryDirectory() as tmp:
-        dataset_dir = Path(tmp) / "dataset"
-        _download_datasets(datasets, dataset_dir)
-        images, labels, class_names = _load_yolo_dataset(dataset_dir, image_size)
+        groups = []
+
+        if yolo_datasets:
+            yolo_dir = Path(tmp) / "yolo"
+            _download_datasets(yolo_datasets, yolo_dir)
+            groups.append(_load_yolo_dataset(yolo_dir, image_size))
+
+        if csv_datasets:
+            csv_dir = Path(tmp) / "csv"
+            _download_csv_datasets(csv_datasets, csv_dir)
+            groups.append(_load_csv_dataset(csv_dir, image_size))
+
+        if not groups:
+            raise ValueError("No datasets provided")
+
+        images, labels, class_names = _merge_datasets(*groups)
 
     if len(images) < 2:
         raise ValueError(f"Need at least 2 samples, got {len(images)}")
@@ -262,7 +392,8 @@ def train_classifier(
         "classes": class_names,
         "image_size": image_size,
         "epochs_ran": len(history.history["loss"]),
-        "datasets": datasets,
+        "yolo_datasets": yolo_datasets,
+        "csv_datasets": csv_datasets or [],
     }
     if has_val:
         loss, acc = model.evaluate(x_val, y_val, verbose=0)
@@ -277,7 +408,7 @@ def train_classifier(
             {
                 "pipeline": "train_classifier",
                 "framework": "tensorflow",
-                "datasets": ",".join(datasets),
+                "datasets": ",".join(yolo_datasets),
             }
         )
         mlflow.log_params(

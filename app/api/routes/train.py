@@ -8,7 +8,12 @@ router = APIRouter(prefix="/train", tags=["train"])
 
 
 class TrainRequest(BaseModel):
-    datasets: list[str] = Field(..., description="MinIO prefixes of YOLO datasets")
+    yolo_datasets: list[str] = Field(
+        default=[], description="MinIO prefixes of YOLO datasets (crops)"
+    )
+    csv_datasets: list[str] = Field(
+        default=[], description="MinIO prefixes of CSV datasets (whole images)"
+    )
     image_size: int = Field(default=160, description="Input image size (square)")
     epochs: int = Field(default=12, description="Max training epochs")
     batch_size: int = Field(default=16, description="Training batch size")
@@ -31,7 +36,8 @@ async def classifier(body: TrainRequest) -> dict:
     try:
         result = await run_in_threadpool(
             train_classifier,
-            body.datasets,
+            body.yolo_datasets,
+            body.csv_datasets or None,
             image_size=body.image_size,
             epochs=body.epochs,
             batch_size=body.batch_size,

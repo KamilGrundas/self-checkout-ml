@@ -258,21 +258,25 @@ The current baseline trainer lives in `train/train_classifier/` and uses stable
 TensorFlow with Keras. The model is logged directly to MLflow through the Keras
 flavor and is not stored locally as the source of truth.
 
-Training from approved extracted samples and external samples:
+Training is triggered via `POST /api/v1/train/classifier` with MinIO dataset prefixes:
 
-```bash
-uv run python train/train_classifier/train.py \
-  --manifest-path ml/manifests/extracted_objects.csv \
-  --dataset-root ml/datasets/extracted \
-  --external-manifest ml/manifests/external_objects.csv \
-  --external-dataset-root ml/datasets/external
+```json
+{
+  "yolo_datasets": ["datasets/releases/shelf-products/...", "datasets/releases/external-products/..."],
+  "csv_datasets": ["datasets/releases/scale-products/..."],
+  "image_size": 160,
+  "epochs": 12,
+  "batch_size": 16,
+  "validation_ratio": 0.2
+}
 ```
 
-Training only from external samples also works. If `ml/manifests/extracted_objects.csv`
-does not exist, the trainer skips it automatically and uses only the external manifest.
+- `yolo_datasets` — YOLO releases (shelf, external); images are **cropped** from bounding boxes
+- `csv_datasets` — CSV releases (scale); **whole images** are used directly
 
-The trainer stores the model directly in MLflow Model Registry and keeps label
-order in MLflow model metadata.
+Both dataset types can be combined in a single training run. Class indices are unified across all sources before training.
+
+The trainer stores the model directly in MLflow Model Registry and keeps label order in MLflow model metadata.
 
 MLflow logging includes:
 - parameters
@@ -342,39 +346,33 @@ cd /Users/kamilgrundas/Repositories/self-checkout/self-checkout-infra
 ```
 
 `label-studio-init` automatically:
-- creates or updates the `scale-products` and `shelf-products` projects
+- creates or updates the `scale-products`, `shelf-products`, and `external-products` projects
 - connects `scale-images`, `uploaded-images`, and `session-images` MinIO buckets
 - connects a raw export bucket for Label Studio snapshot exports
+
+Project labeling schema:
+- `scale-products` — **Choices** (single-label image classification, whole images)
+- `shelf-products` — **RectangleLabels** (bounding box detection)
+- `external-products` — **RectangleLabels** (bounding box detection)
+
+Labels are fetched automatically from the backend product catalog (`GET /api/v1/products/`) on each sync.
+`LABEL_STUDIO_LABELS` is no longer used.
 
 Default local endpoint:
 - `http://127.0.0.1:8080`
 
 ## Build Dataset
 
-`scripts/build_dataset.py` creates a reviewed export snapshot in Label Studio,
-converts it to `YOLO with Images`, and uploads the extracted release to the
-training bucket in MinIO.
+`POST /api/v1/label-studio/export` creates a reviewed export snapshot in Label
+Studio and uploads the release to the training bucket in MinIO.
 
-Example:
-
-```bash
-uv run python scripts/build_dataset.py \
-  --label-studio-url http://127.0.0.1:8080 \
-  --label-studio-api-key <API_KEY> \
-  --project-id 1 \
-  --project-slug scale-products
-```
+The export format depends on the project:
+- `scale-products` → **CSV** (`dataset.csv` + `images/`) — whole images for classification
+- `shelf-products` → **YOLO with Images** (`classes.txt`, `images/`, `labels/`, `dataset.yaml`)
+- `external-products` → **YOLO with Images**
 
 The release is uploaded under:
 - `datasets/releases/<project-slug>/<release-name>/`
-
-Typical contents:
-- `classes.txt`
-- `images/`
-- `labels/`
-- `notes.json`
-- `dataset.yaml`
-- `manifest.json`
 
 ## MLflow
 
@@ -465,10 +463,15 @@ Important variables:
 - `MLFLOW_SHELF_MODEL_NAME`
 - `LABEL_STUDIO_URL`
 - `LABEL_STUDIO_API_KEY`
+- `BACKEND_URL`
 
 `LABEL_STUDIO_API_KEY` should be a personal access token from Label Studio.
-`build_dataset.py` exchanges it through `/api/token/refresh` and then uses the
+The ML service exchanges it through `/api/token/refresh` and then uses the
 returned Bearer access token for API calls.
+
+`BACKEND_URL` points to the backend API used to fetch product names as Label
+Studio labels during sync. In Docker it is set to `http://backend:8000` directly
+in `compose.yml` and does not need to be set in `.env`.
 
 For the shared local stack from `self-checkout-infra`, the relevant host endpoints are:
 - ML API: `http://127.0.0.1:8001`

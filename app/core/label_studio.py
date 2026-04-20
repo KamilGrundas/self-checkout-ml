@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import tempfile
@@ -58,14 +59,39 @@ def _ensure_project(c: httpx.Client, title: str, label_config: str) -> dict:
     for project in projects:
         if project.get("title") == title:
             pid = project["id"]
-            c.patch(
+            patch_r = c.patch(
                 f"/api/projects/{pid}/",
                 json={"label_config": label_config},
-            ).raise_for_status()
+            )
+            if not patch_r.is_success:
+                error_text = patch_r.text
+                if patch_r.status_code == 400 and "incompatible" in error_text:
+                    logger.warning(
+                        "Project '%s' (id=%d) has annotations incompatible with new "
+                        "label config — deleting all tasks and retrying. Detail: %s",
+                        title,
+                        pid,
+                        error_text,
+                    )
+                    c.delete(f"/api/projects/{pid}/tasks/").raise_for_status()
+                    c.patch(
+                        f"/api/projects/{pid}/",
+                        json={"label_config": label_config},
+                    ).raise_for_status()
+                else:
+                    logger.error(
+                        "Failed to update label config for project '%s' (id=%d): %s",
+                        title,
+                        pid,
+                        error_text,
+                    )
+                    patch_r.raise_for_status()
             return c.get(f"/api/projects/{pid}/").json()
 
     r = c.post("/api/projects/", json={"title": title, "label_config": label_config})
-    r.raise_for_status()
+    if not r.is_success:
+        logger.error("Failed to create project '%s': %s", title, r.text)
+        r.raise_for_status()
     return r.json()
 
 
@@ -164,7 +190,7 @@ def _ensure_export_storage(
     ).raise_for_status()
 
 
-def _build_label_config(labels: list[str]) -> str:
+def _build_detect_label_config(labels: list[str]) -> str:
     labels_markup = "\n".join(
         f'    <Label value="{label}" background="green"/>' for label in labels
     )
@@ -178,32 +204,55 @@ def _build_label_config(labels: list[str]) -> str:
     )
 
 
-def _parse_labels() -> list[str]:
-    labels = [s.strip() for s in settings.LABEL_STUDIO_LABELS.split(",") if s.strip()]
+def _build_classify_label_config(labels: list[str]) -> str:
+    choices_markup = "\n".join(f'    <Choice value="{label}"/>' for label in labels)
+    return (
+        "<View>\n"
+        '  <Image name="image" value="$image"/>\n'
+        '  <Choices name="choice" toName="image" choice="single" showInLine="true">\n'
+        f"{choices_markup}\n"
+        "  </Choices>\n"
+        "</View>\n"
+    )
+
+
+def _fetch_labels_from_backend() -> list[str]:
+    url = f"{settings.BACKEND_URL.rstrip('/')}/api/v1/products/"
+    with httpx.Client(timeout=10.0) as c:
+        r = c.get(url, params={"limit": 1000})
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data", data) if isinstance(data, dict) else data
+        labels = [item["name"] for item in items if item.get("name")]
     if not labels:
-        raise ValueError("LABEL_STUDIO_LABELS is empty")
+        raise ValueError(
+            "No products found in backend — cannot configure Label Studio labels"
+        )
     return labels
 
 
-# Each project: (title_setting, bucket_setting, import_storage_title, export_prefix)
+# Each project: (title_setting, bucket_setting, import_storage_title, export_prefix, is_classify)
 _PROJECT_DEFS = [
     (
         "LABEL_STUDIO_SCALE_PROJECT_TITLE",
         "ML_MINIO_SCALE_BUCKET_NAME",
         "scale-images",
         "projects/scale-products",
+        True,
     ),
     (
         "LABEL_STUDIO_SHELF_PROJECT_TITLE",
         "ML_MINIO_SHELF_BUCKET_NAME",
         "shelf-images",
         "projects/shelf-products",
+        False,
     ),
     (
         "LABEL_STUDIO_EXTERNAL_PROJECT_TITLE",
         "ML_MINIO_EXTERNAL_BUCKET_NAME",
         "external-images",
         "projects/external-products",
+        False,
     ),
 ]
 
@@ -213,19 +262,28 @@ def sync_label_studio() -> dict:
 
     Creates/updates 3 projects (scale, shelf, external), each with one
     S3 import storage and one S3 export storage, then syncs all imports.
+    Labels are fetched from the backend product catalog.
 
     Raises httpx.ConnectError if Label Studio is unreachable.
     """
-    labels = _parse_labels()
+    labels = _fetch_labels_from_backend()
     headers = _resolve_auth_headers()
-    label_config = _build_label_config(labels)
+    classify_config = _build_classify_label_config(labels)
+    detect_config = _build_detect_label_config(labels)
 
     results: dict[str, dict] = {}
 
     with _client(headers) as c:
-        for title_attr, bucket_attr, storage_title, export_prefix in _PROJECT_DEFS:
+        for (
+            title_attr,
+            bucket_attr,
+            storage_title,
+            export_prefix,
+            is_classify,
+        ) in _PROJECT_DEFS:
             project_title = getattr(settings, title_attr)
             bucket_name = getattr(settings, bucket_attr)
+            label_config = classify_config if is_classify else detect_config
 
             project = _ensure_project(c, project_title, label_config)
             pid = project["id"]
@@ -376,6 +434,166 @@ def _download_images_for_labels(
     )
 
 
+def _parse_classify_tasks(tasks: list[dict], images_dir: Path) -> list[tuple[str, str]]:
+    """Extract (filename, label) pairs from Label Studio JSON export of a Choices project.
+
+    Downloads each image from MinIO into images_dir.
+    Skips tasks without a choice annotation or whose image cannot be downloaded.
+    """
+    from app.core.object_storage import get_minio_client
+
+    minio = get_minio_client()
+    rows: list[tuple[str, str]] = []
+
+    for task in tasks:
+        image_url = task.get("data", {}).get("image", "")
+        if not image_url:
+            continue
+
+        label: str | None = None
+        for annotation in task.get("annotations", []):
+            for result in annotation.get("result", []):
+                if result.get("type") == "choices":
+                    choices = result.get("value", {}).get("choices", [])
+                    if choices:
+                        label = choices[0]
+                        break
+            if label:
+                break
+
+        if not label:
+            continue
+
+        ext = Path(image_url).suffix.lower() or ".jpg"
+        filename = f"{Path(image_url).stem}{ext}"
+        dest = images_dir / filename
+
+        if not dest.exists():
+            parts = image_url.replace("s3://", "").split("/", 1)
+            if len(parts) != 2:
+                logger.warning("Invalid S3 URL: %s", image_url)
+                continue
+            bucket_name, key = parts
+            try:
+                minio.fget_object(bucket_name, key, str(dest))
+            except Exception as exc:
+                logger.warning("Failed to download %s: %s", image_url, exc)
+                continue
+
+        rows.append((filename, label))
+
+    return rows
+
+
+def _wait_for_export_conversion(
+    c: httpx.Client, pid: int, export_id: int, export_type: str
+) -> None:
+    deadline = time.time() + EXPORT_TIMEOUT
+    while time.time() < deadline:
+        r = c.get(f"/api/projects/{pid}/exports/{export_id}")
+        r.raise_for_status()
+        snapshot = r.json()
+        for fmt in snapshot.get("converted_formats", []):
+            if fmt.get("export_type") != export_type:
+                continue
+            if fmt["status"] == "completed":
+                return
+            if fmt["status"] == "failed":
+                raise RuntimeError(
+                    f"{export_type} conversion failed: {fmt.get('traceback', 'unknown error')}"
+                )
+        time.sleep(2)
+    raise TimeoutError(f"Timed out waiting for {export_type} conversion")
+
+
+def export_csv_dataset(
+    project_title: str,
+    release_name: str | None = None,
+) -> dict:
+    """Export reviewed Choices annotations from a Label Studio project as a CSV
+    dataset (filename,label) with images and upload to the MinIO training bucket.
+    """
+    headers = _resolve_auth_headers()
+    release_name = release_name or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    export_type = "JSON"
+
+    with _client(headers) as c:
+        c.timeout = httpx.Timeout(EXPORT_TIMEOUT)
+
+        project = _find_project_by_title(c, project_title)
+        pid = project["id"]
+        logger.info("Exporting CSV for project '%s' (id=%d)", project_title, pid)
+
+        r = c.post(
+            f"/api/projects/{pid}/exports/",
+            json={"annotation_filter_options": {"reviewed": "only"}},
+        )
+        r.raise_for_status()
+        export_id = r.json()["id"]
+
+        r = c.post(
+            f"/api/projects/{pid}/exports/{export_id}/convert",
+            json={"export_type": export_type, "download_resources": False},
+        )
+        if r.status_code != 200:
+            logger.error("Convert failed (%d): %s", r.status_code, r.text)
+            r.raise_for_status()
+
+        _wait_for_export_conversion(c, pid, export_id, export_type)
+
+        r = c.get(
+            f"/api/projects/{pid}/exports/{export_id}/download",
+            params={"exportType": export_type},
+        )
+        r.raise_for_status()
+        tasks: list[dict] = r.json()
+
+    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    project_slug = project_title.lower().replace(" ", "-")
+    release_prefix = f"datasets/releases/{project_slug}/{release_name}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_dir = Path(tmp) / "dataset"
+        images_dir = extract_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = _parse_classify_tasks(tasks, images_dir)
+        if not rows:
+            raise ValueError("No reviewed classify annotations found in export")
+
+        csv_path = extract_dir / "dataset.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "label"])
+            writer.writerows(rows)
+
+        manifest = {
+            "project_id": pid,
+            "project_title": project_title,
+            "export_id": export_id,
+            "export_type": "CSV",
+            "release_name": release_name,
+            "sample_count": len(rows),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        (extract_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+        uploaded_files = _upload_directory_to_minio(extract_dir, bucket, release_prefix)
+
+    return {
+        "project_id": pid,
+        "project_title": project_title,
+        "export_id": export_id,
+        "release_name": release_name,
+        "bucket": bucket,
+        "release_prefix": release_prefix,
+        "sample_count": len(rows),
+        "uploaded_files": uploaded_files,
+    }
+
+
 def export_yolo_dataset(
     project_title: str,
     release_name: str | None = None,
@@ -422,26 +640,7 @@ def export_yolo_dataset(
             r.raise_for_status()
 
         # 3. Wait for conversion
-        deadline = time.time() + EXPORT_TIMEOUT
-        while time.time() < deadline:
-            r = c.get(f"/api/projects/{pid}/exports/{export_id}")
-            r.raise_for_status()
-            snapshot = r.json()
-            for fmt in snapshot.get("converted_formats", []):
-                if fmt.get("export_type") != export_type:
-                    continue
-                if fmt["status"] == "completed":
-                    break
-                if fmt["status"] == "failed":
-                    raise RuntimeError(
-                        f"YOLO conversion failed: {fmt.get('traceback', 'unknown error')}"
-                    )
-            else:
-                time.sleep(2)
-                continue
-            break
-        else:
-            raise TimeoutError("Timed out waiting for YOLO conversion")
+        _wait_for_export_conversion(c, pid, export_id, export_type)
 
         # 4. Download zip
         r = c.get(
@@ -504,3 +703,24 @@ def export_yolo_dataset(
         "release_prefix": release_prefix,
         "uploaded_files": uploaded_files,
     }
+
+
+def export_dataset(
+    project_title: str,
+    release_name: str | None = None,
+) -> dict:
+    """Export a Label Studio project dataset.
+
+    Routes to CSV export for classify projects (scale) and YOLO export for
+    detect projects (shelf, external), based on _PROJECT_DEFS.
+    """
+    for title_attr, _, _, _, is_classify in _PROJECT_DEFS:
+        if getattr(settings, title_attr) == project_title:
+            if is_classify:
+                return export_csv_dataset(project_title, release_name)
+            else:
+                return export_yolo_dataset(project_title, release_name)
+    known = [getattr(settings, t) for t, *_ in _PROJECT_DEFS]
+    raise ValueError(
+        f"Unknown project title: '{project_title}'. Known projects: {known}"
+    )

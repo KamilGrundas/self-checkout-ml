@@ -2,7 +2,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from starlette.concurrency import run_in_threadpool
 
-from app.core.label_studio import export_yolo_dataset, sync_label_studio
+from app.core.label_studio import export_dataset, sync_label_studio
 
 router = APIRouter(prefix="/label-studio", tags=["label-studio"])
 
@@ -34,9 +34,7 @@ async def export(
     Returns 503 if Label Studio is unreachable.
     """
     try:
-        result = await run_in_threadpool(
-            export_yolo_dataset, project_title, release_name
-        )
+        result = await run_in_threadpool(export_dataset, project_title, release_name)
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Label Studio is not reachable")
     except (RuntimeError, ValueError, TimeoutError) as exc:
