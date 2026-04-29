@@ -32,12 +32,15 @@ def _resolve_auth_headers() -> dict[str, str]:
     if not api_key:
         raise RuntimeError("LABEL_STUDIO_API_KEY is not configured")
 
-    direct = {"Authorization": f"Bearer {api_key}"}
-    with _client(direct) as c:
-        r = c.get("/api/projects/", params={"page_size": 1})
-        if r.status_code not in {400, 401, 403}:
-            r.raise_for_status()
-            return direct
+    for headers in (
+        {"Authorization": f"Token {api_key}"},
+        {"Authorization": f"Bearer {api_key}"},
+    ):
+        with _client(headers) as c:
+            r = c.get("/api/projects/", params={"page_size": 1})
+            if r.status_code not in {400, 401, 403}:
+                r.raise_for_status()
+                return headers
 
     with _client({}) as c:
         r = c.post("/api/token/refresh", json={"refresh": api_key})
@@ -255,6 +258,16 @@ _PROJECT_DEFS = [
         False,
     ),
 ]
+
+
+def list_projects() -> list[dict]:
+    headers = _resolve_auth_headers()
+    with _client(headers) as c:
+        r = c.get("/api/projects/", params={"page_size": 100})
+        r.raise_for_status()
+        data = r.json()
+        projects = data.get("results", data) if isinstance(data, dict) else data
+        return [{"id": p["id"], "title": p["title"]} for p in projects]
 
 
 def sync_label_studio() -> dict:

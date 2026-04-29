@@ -2,9 +2,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from app.api.deps import SuperuserDep
 from app.core.training import check_mlflow, train_classifier
 
-router = APIRouter(prefix="/train", tags=["train"])
+router = APIRouter(prefix="/train", tags=["train"], dependencies=[SuperuserDep])
 
 
 class TrainRequest(BaseModel):

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
+from app.api.deps import SuperuserDep
 from app.core.config import settings
 from app.core.datasets import delete_dataset, list_datasets
 from app.core.object_storage import public_object_url, store_dataset_image
@@ -8,7 +9,7 @@ from app.schemas import StoredImagePublic
 
 from fastapi.responses import HTMLResponse
 
-router = APIRouter(prefix="/datasets", tags=["datasets"])
+router = APIRouter(prefix="/datasets", tags=["datasets"], dependencies=[SuperuserDep])
 
 
 async def _upload_raw_image(

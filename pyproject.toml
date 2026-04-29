@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>2.0",
     "pydantic-settings<3.0.0,>=2.2.1",
     "minio<8.0.0,>=7.2.15",
+    "PyJWT>=2.8.0,<3.0.0",
     "opencv-python-headless<5.0.0,>=4.10.0",
     "keras>=3.13.2",
     "tensorflow>=2.21,<2.22",

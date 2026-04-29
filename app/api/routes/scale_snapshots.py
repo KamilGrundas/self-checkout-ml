@@ -2,6 +2,7 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from app.api.deps import SuperuserDep
 from app.core.config import settings
 from app.core.object_storage import (
     build_object_name,
@@ -54,7 +55,11 @@ async def upload_scale_snapshot(
     )
 
 
-@router.get("/{session_id}/scale-snapshots", response_model=SessionSnapshotListPublic)
+@router.get(
+    "/{session_id}/scale-snapshots",
+    response_model=SessionSnapshotListPublic,
+    dependencies=[SuperuserDep],
+)
 def list_scale_snapshots(session_id: str) -> SessionSnapshotListPublic:
     ensure_bucket_exists(settings.ML_MINIO_SCALE_BUCKET_NAME)
     client = get_minio_client()

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Self-Checkout ML"
+    SECRET_KEY: str = ""
     ENVIRONMENT: str = "local"
     FRONTEND_HOST: str = "http://localhost:5173"
     BACKEND_CORS_ORIGINS: Annotated[
