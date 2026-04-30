@@ -22,9 +22,23 @@ class PredictionPublic(BaseModel):
     run_id: str
 
 
-class ModelRefreshPublic(BaseModel):
+class ModelVersionPublic(BaseModel):
+    name: str
+    version: int
+    run_id: str
+    status: str
+    description: str | None = None
+    created_at: str | None = None
+    is_active: bool = False
+
+
+class SetModelRequest(BaseModel):
+    version: int
+
+
+class ModelActivatedPublic(BaseModel):
     model_name: str
-    model_version: int | None = None
+    model_version: int
     run_id: str
     cache_key: str
 

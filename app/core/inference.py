@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,13 +21,11 @@ def configure_local_caches() -> None:
         "MPLCONFIGDIR",
         str((local_cache_dir / "matplotlib").resolve()),
     )
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "5")
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "120")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
 
 
 class KerasRegistryModelStore:
-    REFRESH_COOLDOWN_SECONDS = 60
-
     def __init__(
         self,
         *,
@@ -48,7 +45,6 @@ class KerasRegistryModelStore:
         self._cached_model: Any | None = None
         self._cached_labels: list[str] | None = None
         self._refresh_lock = threading.Lock()
-        self._last_manual_refresh_at = 0.0
         self._cache_dir = Path(settings.MODEL_CACHE_DIR)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,7 +136,6 @@ class KerasRegistryModelStore:
         self, latest_version: ModelVersion
     ) -> tuple[Any, list[str]]:
         import mlflow.keras
-        from mlflow.exceptions import MlflowException
         from mlflow.models import get_model_info
 
         model_uri = f"models:/{latest_version.name}/{latest_version.version}"
@@ -151,10 +146,10 @@ class KerasRegistryModelStore:
             if not isinstance(labels, list) or not labels:
                 raise ValueError("Missing labels in MLflow model metadata")
             model = mlflow.keras.load_model(model_uri)
-        except (MlflowException, ValueError) as error:
+        except Exception as error:
             raise HTTPException(
                 status_code=503,
-                detail=f"Failed to load model from MLflow for {self._registered_model_name}.",
+                detail=f"Failed to load model from MLflow: {type(error).__name__}: {error}",
             ) from error
         return model, labels
 
@@ -187,42 +182,119 @@ class KerasRegistryModelStore:
         self._cached_labels = labels
         return model, labels, latest_version.run_id
 
-    def refresh_latest_model(self) -> dict[str, str | int]:
-        with self._refresh_lock:
-            now = time.monotonic()
-            seconds_since_refresh = now - self._last_manual_refresh_at
-            if seconds_since_refresh < self.REFRESH_COOLDOWN_SECONDS:
-                retry_after = int(self.REFRESH_COOLDOWN_SECONDS - seconds_since_refresh)
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        "Model refresh is rate limited. "
-                        f"Retry after {retry_after} seconds."
-                    ),
-                    headers={"Retry-After": str(retry_after)},
+    def _active_cache_key(self) -> str | None:
+        if self._cached_cache_key:
+            return self._cached_cache_key
+        metadata_path = self._disk_metadata_path()
+        if not metadata_path.exists():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            name = metadata.get("registered_model_name")
+            version = metadata.get("registered_model_version")
+            if name and version:
+                return f"{name}:{version}"
+        except Exception:
+            pass
+        return None
+
+    def list_versions(self) -> list[dict]:
+        from mlflow.exceptions import MlflowException
+
+        try:
+            versions = list(
+                self._client.search_model_versions(
+                    f"name='{self._registered_model_name}'"
                 )
+            )
+        except MlflowException as error:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "MLflow is unavailable or misconfigured. "
+                    f"Tracking URI: {settings.MLFLOW_TRACKING_URI}."
+                ),
+            ) from error
 
-            latest_version = self._latest_registered_model()
-            model, labels = self._load_from_registry(latest_version)
-            cache_key = f"{latest_version.name}:{latest_version.version}"
+        active_key = self._active_cache_key()
+        result = []
+        for v in sorted(versions, key=lambda v: int(v.version), reverse=True):
+            cache_key = f"{v.name}:{v.version}"
+            result.append(
+                {
+                    "name": v.name,
+                    "version": int(v.version),
+                    "run_id": v.run_id,
+                    "status": v.status,
+                    "description": v.description or None,
+                    "created_at": (
+                        str(v.creation_timestamp) if v.creation_timestamp else None
+                    ),
+                    "is_active": cache_key == active_key,
+                }
+            )
+        return result
 
+    def set_version(self, version: int) -> dict:
+        from mlflow.exceptions import MlflowException
+
+        with self._refresh_lock:
+            # Load from disk cache if the requested version is already cached there
+            metadata_path = self._disk_metadata_path()
+            if metadata_path.exists():
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if str(metadata.get("registered_model_version")) == str(version):
+                        disk = self._load_from_disk_cache()
+                        if disk is not None:
+                            return {
+                                "model_name": self._registered_model_name,
+                                "model_version": version,
+                                "run_id": self._cached_run_id or "",
+                                "cache_key": self._cached_cache_key or "",
+                            }
+                except Exception:
+                    pass
+
+            # Not on disk — fetch from MLflow registry
+            try:
+                target = self._client.get_model_version(
+                    self._registered_model_name, str(version)
+                )
+            except MlflowException as error:
+                raise HTTPException(
+                    status_code=404 if "RESOURCE_DOES_NOT_EXIST" in str(error) else 503,
+                    detail=f"Version {version} not found for model {self._registered_model_name}."
+                    if "RESOURCE_DOES_NOT_EXIST" in str(error)
+                    else f"MLflow error: {type(error).__name__}: {error}",
+                ) from error
+            try:
+                model, labels = self._load_from_registry(target)
+            except HTTPException:
+                raise
+            except Exception as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load model: {type(error).__name__}: {error}",
+                ) from error
+
+            cache_key = f"{target.name}:{target.version}"
             self._write_disk_cache(
                 model=model,
                 labels=labels,
-                run_id=latest_version.run_id,
-                registered_model_name=latest_version.name,
-                registered_model_version=latest_version.version,
+                run_id=target.run_id,
+                registered_model_name=target.name,
+                registered_model_version=target.version,
             )
             self._cached_cache_key = cache_key
-            self._cached_run_id = latest_version.run_id
+            self._cached_run_id = target.run_id
             self._cached_model = model
             self._cached_labels = labels
-            self._last_manual_refresh_at = time.monotonic()
 
             return {
-                "model_name": latest_version.name,
-                "model_version": int(latest_version.version),
-                "run_id": latest_version.run_id,
+                "model_name": target.name,
+                "model_version": int(target.version),
+                "run_id": target.run_id,
                 "cache_key": cache_key,
             }
 

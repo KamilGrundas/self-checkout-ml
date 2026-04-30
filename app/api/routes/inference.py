@@ -3,7 +3,12 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import SuperuserDep
 from app.core.inference import classifier_model_store, shelf_model_store
-from app.schemas import ModelRefreshPublic, PredictionPublic
+from app.schemas import (
+    ModelActivatedPublic,
+    ModelVersionPublic,
+    PredictionPublic,
+    SetModelRequest,
+)
 
 router = APIRouter(prefix="/inference", tags=["inference"])
 
@@ -40,21 +45,41 @@ async def detect_image(file: UploadFile = File(...)) -> PredictionPublic:
     return PredictionPublic(scores=scores, run_id=run_id)
 
 
-@router.post(
-    "/refresh-classify-model",
-    response_model=ModelRefreshPublic,
+@router.get(
+    "/classify-models",
+    response_model=list[ModelVersionPublic],
     dependencies=[SuperuserDep],
 )
-def refresh_classify_model() -> ModelRefreshPublic:
-    refresh_result = classifier_model_store.refresh_latest_model()
-    return ModelRefreshPublic(**refresh_result)
+async def list_classify_models() -> list[ModelVersionPublic]:
+    versions = await run_in_threadpool(classifier_model_store.list_versions)
+    return [ModelVersionPublic(**v) for v in versions]
+
+
+@router.get(
+    "/detect-models",
+    response_model=list[ModelVersionPublic],
+    dependencies=[SuperuserDep],
+)
+async def list_detect_models() -> list[ModelVersionPublic]:
+    versions = await run_in_threadpool(shelf_model_store.list_versions)
+    return [ModelVersionPublic(**v) for v in versions]
 
 
 @router.post(
-    "/refresh-detect-model",
-    response_model=ModelRefreshPublic,
+    "/set-classify-model",
+    response_model=ModelActivatedPublic,
     dependencies=[SuperuserDep],
 )
-def refresh_detect_model() -> ModelRefreshPublic:
-    refresh_result = shelf_model_store.refresh_latest_model()
-    return ModelRefreshPublic(**refresh_result)
+async def set_classify_model(body: SetModelRequest) -> ModelActivatedPublic:
+    result = await run_in_threadpool(classifier_model_store.set_version, body.version)
+    return ModelActivatedPublic(**result)
+
+
+@router.post(
+    "/set-detect-model",
+    response_model=ModelActivatedPublic,
+    dependencies=[SuperuserDep],
+)
+async def set_detect_model(body: SetModelRequest) -> ModelActivatedPublic:
+    result = await run_in_threadpool(shelf_model_store.set_version, body.version)
+    return ModelActivatedPublic(**result)
