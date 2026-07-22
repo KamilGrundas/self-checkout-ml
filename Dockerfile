@@ -11,14 +11,14 @@ WORKDIR /app/
 ENV PATH="/app/.venv/bin:$PATH"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project
 
-COPY ./pyproject.toml /app/
+COPY ./pyproject.toml ./uv.lock /app/
 COPY ./app /app/app
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --no-dev
+    uv sync --frozen --no-dev
 
 CMD ["fastapi", "run", "--workers", "2", "app/main.py"]
