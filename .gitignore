@@ -5,3 +5,8 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+datasets/
+models/
+mlruns/
