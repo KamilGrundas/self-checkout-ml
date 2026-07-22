@@ -1,8 +1,8 @@
-FROM python:3.12.13-slim
+FROM python:3.12.13-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1
 
-COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /bin/
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
