@@ -1,6 +1,6 @@
 # ML repository instructions
 
-Python 3.12 FastAPI service. API code is under `app/api`, core storage/training/inference integrations under `app/core`, and dependency/configuration metadata is in `pyproject.toml` and `uv.lock`.
+Python 3.13 FastAPI service. API code is under `app/api`, core storage/training/inference integrations under `app/core`, and dependency/configuration metadata is in `pyproject.toml` and `uv.lock`.
 
 Read `../AGENTS.md` first. Inspect Git with `git -C self-checkout-ml`; never edit directly on `main` or `master`, combine repositories in one commit, or commit `.env`, `.venv`, caches, datasets, snapshots, trained model artifacts, Label Studio tokens, MLflow credentials, or MinIO credentials. Destructive dataset/reset utilities require explicit user approval and must never be part of routine validation.
 

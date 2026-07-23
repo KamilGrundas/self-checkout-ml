@@ -1,8 +1,8 @@
-FROM python:3.12.13-slim-bookworm
+FROM python:3.13.14-slim-bookworm@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64
 
 ENV PYTHONUNBUFFERED=1
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.31@sha256:ecd4de2f060c64bea0ff8ecb182ddf46ba3fcccdc8a60cfdbaf20d1a047d7437 /uv /uvx /bin/
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
