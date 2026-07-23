@@ -484,7 +484,10 @@ Inside Docker in the shared stack:
 
 ## Python Version
 
-The repository is pinned to Python `3.12.13` via `.python-version`.
+The repository is pinned to Python `3.13.14` via `.python-version`. Python 3.14
+is not yet supported because TensorFlow 2.21 does not publish CPython 3.14
+wheels. Re-evaluate the runtime after TensorFlow publishes `cp314` Linux
+wheels for a stable release.
 
 Core ML stack:
 - `tensorflow`
@@ -496,7 +499,7 @@ Core ML stack:
 Install dependencies:
 
 ```bash
-uv sync --python 3.12.13
+uv sync --python 3.13.14
 ```
 
 Run the API:

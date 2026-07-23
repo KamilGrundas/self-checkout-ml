@@ -2,7 +2,7 @@
 name = "self-checkout-ml"
 version = "0.1.0"
 description = "ML snapshot storage API for self-checkout sessions"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi[standard]<1.0.0,>=0.114.2",
     "mlflow>=3.1,<4.0",
@@ -29,4 +29,4 @@ build-backend = "hatchling.build"
 packages = ["app"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py313"
