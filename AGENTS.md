@@ -8,6 +8,6 @@ Current static validation is `uv run --group dev ruff check app` and `uv run --g
 
 Use `../ops/dev-sync.sh --repo ml --dry-run`, then `../ops/dev-test.sh --repo ml`. Keep commits focused and imperative; coordinate inference contracts, storage buckets, and model-registry changes with backend, admin, and infra PRs.
 
-The temporary base branch is `dev` as recorded in `../repos.yaml`; the target base after migration is `main`. Never implement directly on `dev`, `main`, or `master`. Use Conventional Commits with scopes such as `ml`, `api`, `inference`, `training`, `datasets`, or `storage`.
+The base branch is `main` as recorded in `../repos.yaml`. Create short-lived branches from a freshly fetched `origin/main`, and never implement directly on `main` or `master`. Use Conventional Commits with scopes such as `ml`, `api`, `inference`, `training`, `datasets`, or `storage`.
 
 Definition of Done: Ruff lint and formatting, image build, API health, and affected integration checks pass on remote dev; new behavior has tests when a test suite is introduced; model/dataset artifacts and credentials remain untracked; resource and model compatibility are documented; and rollback is stated.
