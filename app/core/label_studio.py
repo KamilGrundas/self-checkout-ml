@@ -27,10 +27,10 @@ def _client(headers: dict[str, str]) -> httpx.Client:
     )
 
 
-def _resolve_auth_headers() -> dict[str, str]:
-    api_key = settings.LABEL_STUDIO_API_KEY
+def _resolve_auth_headers(api_key: str) -> dict[str, str]:
+    api_key = api_key.strip()
     if not api_key:
-        raise RuntimeError("LABEL_STUDIO_API_KEY is not configured")
+        raise ValueError("Label Studio API key is required")
 
     for headers in (
         {"Authorization": f"Token {api_key}"},
@@ -260,8 +260,8 @@ _PROJECT_DEFS = [
 ]
 
 
-def list_projects() -> list[dict]:
-    headers = _resolve_auth_headers()
+def list_projects(api_key: str) -> list[dict]:
+    headers = _resolve_auth_headers(api_key)
     with _client(headers) as c:
         r = c.get("/api/projects/", params={"page_size": 100})
         r.raise_for_status()
@@ -270,7 +270,7 @@ def list_projects() -> list[dict]:
         return [{"id": p["id"], "title": p["title"]} for p in projects]
 
 
-def sync_label_studio() -> dict:
+def sync_label_studio(api_key: str) -> dict:
     """Sync S3-compatible object storage buckets with Label Studio projects.
 
     Creates/updates 3 projects (scale, shelf, external), each with one
@@ -280,7 +280,7 @@ def sync_label_studio() -> dict:
     Raises httpx.ConnectError if Label Studio is unreachable.
     """
     labels = _fetch_labels_from_backend()
-    headers = _resolve_auth_headers()
+    headers = _resolve_auth_headers(api_key)
     classify_config = _build_classify_label_config(labels)
     detect_config = _build_detect_label_config(labels)
 
@@ -521,12 +521,13 @@ def _wait_for_export_conversion(
 
 def export_csv_dataset(
     project_title: str,
+    api_key: str,
     release_name: str | None = None,
 ) -> dict:
     """Export reviewed Choices annotations from a Label Studio project as a CSV
     dataset (filename,label) with images and upload to the S3-compatible object storage training bucket.
     """
-    headers = _resolve_auth_headers()
+    headers = _resolve_auth_headers(api_key)
     release_name = release_name or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     export_type = "JSON"
 
@@ -611,6 +612,7 @@ def export_csv_dataset(
 
 def export_yolo_dataset(
     project_title: str,
+    api_key: str,
     release_name: str | None = None,
 ) -> dict:
     """Export reviewed annotations from a Label Studio project as a YOLO
@@ -625,7 +627,7 @@ def export_yolo_dataset(
 
     Raises httpx.ConnectError if Label Studio is unreachable.
     """
-    headers = _resolve_auth_headers()
+    headers = _resolve_auth_headers(api_key)
     release_name = release_name or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     export_type = "YOLO_WITH_IMAGES"
 
@@ -724,6 +726,7 @@ def export_yolo_dataset(
 
 def export_dataset(
     project_title: str,
+    api_key: str,
     release_name: str | None = None,
 ) -> dict:
     """Export a Label Studio project dataset.
@@ -734,9 +737,9 @@ def export_dataset(
     for title_attr, _, _, _, is_classify in _PROJECT_DEFS:
         if getattr(settings, title_attr) == project_title:
             if is_classify:
-                return export_csv_dataset(project_title, release_name)
+                return export_csv_dataset(project_title, api_key, release_name)
             else:
-                return export_yolo_dataset(project_title, release_name)
+                return export_yolo_dataset(project_title, api_key, release_name)
     known = [getattr(settings, t) for t, *_ in _PROJECT_DEFS]
     raise ValueError(
         f"Unknown project title: '{project_title}'. Known projects: {known}"

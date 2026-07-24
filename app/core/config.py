@@ -60,7 +60,6 @@ class Settings(BaseSettings):
     MODEL_CACHE_DIR: str = ".cache/model_store"
     BACKEND_URL: str = "http://127.0.0.1:8000"
     LABEL_STUDIO_URL: str = "http://127.0.0.1:8080"
-    LABEL_STUDIO_API_KEY: str = ""
     LABEL_STUDIO_SCALE_PROJECT_TITLE: str = "scale-products"
     LABEL_STUDIO_SHELF_PROJECT_TITLE: str = "shelf-products"
     LABEL_STUDIO_EXTERNAL_PROJECT_TITLE: str = "external-products"

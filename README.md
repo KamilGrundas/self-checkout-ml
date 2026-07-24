@@ -364,7 +364,9 @@ Default local endpoint:
 ## Build Dataset
 
 `POST /api/v1/label-studio/export` creates a reviewed export snapshot in Label
-Studio and uploads the release to the training bucket in S3-compatible object storage.
+Studio and uploads the release to the training bucket in S3-compatible object
+storage. All `/api/v1/label-studio/*` endpoints require the Label Studio personal
+access token in the `X-Label-Studio-Api-Key` request header.
 
 The export format depends on the project:
 - `scale-products` → **CSV** (`dataset.csv` + `images/`) — whole images for classification
@@ -462,12 +464,13 @@ Important variables:
 - `MLFLOW_REGISTERED_MODEL_NAME`
 - `MLFLOW_SHELF_MODEL_NAME`
 - `LABEL_STUDIO_URL`
-- `LABEL_STUDIO_API_KEY`
 - `BACKEND_URL`
 
-`LABEL_STUDIO_API_KEY` should be a personal access token from Label Studio.
-The ML service exchanges it through `/api/token/refresh` and then uses the
-returned Bearer access token for API calls.
+The Label Studio personal access token is supplied by an authenticated
+superuser through the admin UI for each browser session. The ML service does
+not read or persist it in configuration. It exchanges the request header value
+through `/api/token/refresh` when required and uses the returned Bearer access
+token only for the current operation.
 
 `BACKEND_URL` points to the backend API used to fetch product names as Label
 Studio labels during sync. In Docker it is set to `http://backend:8000` directly
