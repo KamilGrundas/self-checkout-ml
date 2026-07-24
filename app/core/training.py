@@ -1,4 +1,4 @@
-"""Train a Keras image classifier from YOLO and CSV datasets stored in MinIO."""
+"""Train a Keras image classifier from YOLO and CSV datasets stored in S3-compatible object storage."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def _download_datasets(prefixes: list[str], dest: Path) -> None:
-    from app.core.object_storage import get_minio_client
+    from app.core.object_storage import get_object_storage
 
-    client = get_minio_client()
-    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    client = get_object_storage()
+    bucket = settings.S3_TRAINING_BUCKET
     images_dir = dest / "images"
     labels_dir = dest / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -28,18 +28,18 @@ def _download_datasets(prefixes: list[str], dest: Path) -> None:
 
     for prefix in prefixes:
         prefix = prefix.rstrip("/") + "/"
-        for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+        for obj in client.list_objects(bucket, prefix=prefix):
             rel = obj.object_name[len(prefix) :]
             if rel.startswith("images/"):
-                client.fget_object(
+                client.download_file(
                     bucket, obj.object_name, str(images_dir / Path(rel).name)
                 )
             elif rel.startswith("labels/"):
-                client.fget_object(
+                client.download_file(
                     bucket, obj.object_name, str(labels_dir / Path(rel).name)
                 )
             elif rel == "classes.txt":
-                data = client.get_object(bucket, obj.object_name).read()
+                data = client.get_bytes(bucket, obj.object_name)
                 for line in data.decode("utf-8").strip().splitlines():
                     if line.strip() and line.strip() not in all_classes:
                         all_classes.append(line.strip())
@@ -121,10 +121,10 @@ def _load_yolo_dataset(
 
 
 def _download_csv_datasets(prefixes: list[str], dest: Path) -> None:
-    from app.core.object_storage import get_minio_client
+    from app.core.object_storage import get_object_storage
 
-    client = get_minio_client()
-    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    client = get_object_storage()
+    bucket = settings.S3_TRAINING_BUCKET
     images_dir = dest / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -135,12 +135,10 @@ def _download_csv_datasets(prefixes: list[str], dest: Path) -> None:
         csv_data: str | None = None
         image_objects: dict[str, str] = {}  # filename -> object_name
 
-        for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+        for obj in client.list_objects(bucket, prefix=prefix):
             rel = obj.object_name[len(prefix) :]
             if rel == "dataset.csv":
-                csv_data = (
-                    client.get_object(bucket, obj.object_name).read().decode("utf-8")
-                )
+                csv_data = client.get_bytes(bucket, obj.object_name).decode("utf-8")
             elif rel.startswith("images/"):
                 image_objects[Path(rel).name] = obj.object_name
 
@@ -157,7 +155,7 @@ def _download_csv_datasets(prefixes: list[str], dest: Path) -> None:
             if filename in image_objects:
                 dest_path = images_dir / unique_name
                 if not dest_path.exists():
-                    client.fget_object(bucket, image_objects[filename], str(dest_path))
+                    client.download_file(bucket, image_objects[filename], dest_path)
                 all_rows.append((unique_name, label))
 
     with (dest / "dataset.csv").open("w", encoding="utf-8", newline="") as f:
@@ -286,7 +284,11 @@ def check_mlflow() -> None:
     import urllib.error
     import urllib.request
 
-    url = f"{settings.MLFLOW_TRACKING_URI}/health"
+    if not settings.MLFLOW_TRACKING_URI:
+        raise RuntimeError(
+            "MLflow is disabled because MLFLOW_TRACKING_URI is not configured"
+        )
+    url = f"{settings.MLFLOW_TRACKING_URI.rstrip('/')}/health"
     try:
         urllib.request.urlopen(url, timeout=5)
     except (urllib.error.URLError, OSError) as exc:
@@ -305,7 +307,7 @@ def train_classifier(
     validation_ratio: float = 0.2,
 ) -> dict:
     """Train a classifier from YOLO datasets (crops) and/or CSV datasets (whole images)
-    stored in MinIO and register the result in MLflow.
+    stored in S3-compatible object storage and register the result in MLflow.
     """
     import os
 
