@@ -10,10 +10,12 @@ router = APIRouter(prefix="/train", tags=["train"], dependencies=[SuperuserDep])
 
 class TrainRequest(BaseModel):
     yolo_datasets: list[str] = Field(
-        default=[], description="MinIO prefixes of YOLO datasets (crops)"
+        default=[],
+        description="S3-compatible object storage prefixes of YOLO datasets (crops)",
     )
     csv_datasets: list[str] = Field(
-        default=[], description="MinIO prefixes of CSV datasets (whole images)"
+        default=[],
+        description="S3-compatible object storage prefixes of CSV datasets (whole images)",
     )
     image_size: int = Field(default=160, description="Input image size (square)")
     epochs: int = Field(default=12, description="Max training epochs")
@@ -25,7 +27,7 @@ class TrainRequest(BaseModel):
 
 @router.post("/classifier")
 async def classifier(body: TrainRequest) -> dict:
-    """Train a classifier on specified YOLO datasets from MinIO.
+    """Train a classifier on specified YOLO datasets from S3-compatible object storage.
 
     Returns 503 if MLflow is not reachable.
     """

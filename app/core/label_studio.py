@@ -104,10 +104,10 @@ def _import_storage_payload(project_id: int, title: str, bucket: str) -> dict:
         "title": title,
         "bucket": bucket,
         "prefix": "",
-        "aws_access_key_id": settings.MINIO_ACCESS_KEY,
-        "aws_secret_access_key": settings.MINIO_SECRET_KEY,
-        "s3_endpoint": f"http://{settings.MINIO_ENDPOINT}",
-        "region_name": "us-east-1",
+        "aws_access_key_id": settings.S3_ACCESS_KEY_ID,
+        "aws_secret_access_key": settings.S3_SECRET_ACCESS_KEY,
+        "s3_endpoint": str(settings.S3_ENDPOINT_URL),
+        "region_name": settings.S3_REGION,
         "recursive_scan": True,
         "regex_filter": r".*\.(png|jpg|jpeg|webp)$",
         "presign": False,
@@ -184,10 +184,10 @@ def _ensure_export_storage(
             "title": title,
             "bucket": bucket,
             "prefix": prefix,
-            "aws_access_key_id": settings.MINIO_ACCESS_KEY,
-            "aws_secret_access_key": settings.MINIO_SECRET_KEY,
-            "s3_endpoint": f"http://{settings.MINIO_ENDPOINT}",
-            "region_name": "us-east-1",
+            "aws_access_key_id": settings.S3_ACCESS_KEY_ID,
+            "aws_secret_access_key": settings.S3_SECRET_ACCESS_KEY,
+            "s3_endpoint": str(settings.S3_ENDPOINT_URL),
+            "region_name": settings.S3_REGION,
             "can_delete_objects": False,
         },
     ).raise_for_status()
@@ -238,21 +238,21 @@ def _fetch_labels_from_backend() -> list[str]:
 _PROJECT_DEFS = [
     (
         "LABEL_STUDIO_SCALE_PROJECT_TITLE",
-        "ML_MINIO_SCALE_BUCKET_NAME",
+        "S3_SCALE_BUCKET",
         "scale-images",
         "projects/scale-products",
         True,
     ),
     (
         "LABEL_STUDIO_SHELF_PROJECT_TITLE",
-        "ML_MINIO_SHELF_BUCKET_NAME",
+        "S3_SHELF_BUCKET",
         "shelf-images",
         "projects/shelf-products",
         False,
     ),
     (
         "LABEL_STUDIO_EXTERNAL_PROJECT_TITLE",
-        "ML_MINIO_EXTERNAL_BUCKET_NAME",
+        "S3_EXTERNAL_BUCKET",
         "external-images",
         "projects/external-products",
         False,
@@ -271,7 +271,7 @@ def list_projects() -> list[dict]:
 
 
 def sync_label_studio() -> dict:
-    """Sync MinIO buckets with Label Studio projects.
+    """Sync S3-compatible object storage buckets with Label Studio projects.
 
     Creates/updates 3 projects (scale, shelf, external), each with one
     S3 import storage and one S3 export storage, then syncs all imports.
@@ -319,7 +319,7 @@ def sync_label_studio() -> dict:
                 c,
                 pid,
                 f"{storage_title}-exports",
-                settings.ML_MINIO_LABELSTUDIO_EXPORT_BUCKET_NAME,
+                settings.S3_LABEL_STUDIO_EXPORT_BUCKET,
                 export_prefix,
             )
 
@@ -358,11 +358,13 @@ def _build_dataset_yaml(classes_path: Path) -> str:
     return f"path: .\ntrain: images\nval: images\nnames:\n{names_lines}\n"
 
 
-def _upload_directory_to_minio(local_root: Path, bucket_name: str, prefix: str) -> int:
-    from app.core.object_storage import ensure_bucket_exists, get_minio_client
+def _upload_directory_to_object_storage(
+    local_root: Path, bucket_name: str, prefix: str
+) -> int:
+    from app.core.object_storage import ensure_bucket_exists, get_object_storage
 
     ensure_bucket_exists(bucket_name)
-    client = get_minio_client()
+    client = get_object_storage()
     uploaded = 0
     ext_to_ct = {
         ".txt": "text/plain",
@@ -376,12 +378,10 @@ def _upload_directory_to_minio(local_root: Path, bucket_name: str, prefix: str) 
         if not path.is_file():
             continue
         object_name = f"{prefix.rstrip('/')}/{path.relative_to(local_root).as_posix()}"
-        data = path.read_bytes()
-        client.put_object(
-            bucket_name=bucket_name,
-            object_name=object_name,
-            data=BytesIO(data),
-            length=len(data),
+        client.upload_file(
+            bucket_name,
+            object_name,
+            path,
             content_type=ext_to_ct.get(path.suffix.lower(), "application/octet-stream"),
         )
         uploaded += 1
@@ -394,14 +394,14 @@ def _download_images_for_labels(
     labels_dir: Path,
     images_dir: Path,
 ) -> None:
-    """Download task images from MinIO for each label file.
+    """Download task images from S3-compatible object storage for each label file.
 
     YOLO export label filenames match the image filename stem in the S3 URL
     (e.g. label ``abc123.txt`` corresponds to ``s3://bucket/.../abc123.jpg``).
     We fetch all project tasks, build a stem→s3_url map, and download matching
-    images directly from MinIO.
+    images directly from S3-compatible object storage.
     """
-    from app.core.object_storage import get_minio_client
+    from app.core.object_storage import get_object_storage
 
     label_stems = {p.stem for p in labels_dir.iterdir() if p.suffix == ".txt"}
     if not label_stems:
@@ -422,8 +422,8 @@ def _download_images_for_labels(
             if stem in label_stems:
                 stem_to_s3[stem] = image_url
 
-    # Download images from MinIO
-    minio = get_minio_client()
+    # Download images from S3-compatible object storage
+    object_storage = get_object_storage()
     for stem, s3_url in stem_to_s3.items():
         ext = Path(s3_url).suffix.lower() or ".jpg"
         dest = images_dir / f"{stem}{ext}"
@@ -436,7 +436,7 @@ def _download_images_for_labels(
             continue
         bucket_name, key = parts
         try:
-            minio.fget_object(bucket_name, key, str(dest))
+            object_storage.download_file(bucket_name, key, dest)
         except Exception as exc:
             logger.warning("Failed to download %s: %s", s3_url, exc)
 
@@ -450,12 +450,12 @@ def _download_images_for_labels(
 def _parse_classify_tasks(tasks: list[dict], images_dir: Path) -> list[tuple[str, str]]:
     """Extract (filename, label) pairs from Label Studio JSON export of a Choices project.
 
-    Downloads each image from MinIO into images_dir.
+    Downloads each image from S3-compatible object storage into images_dir.
     Skips tasks without a choice annotation or whose image cannot be downloaded.
     """
-    from app.core.object_storage import get_minio_client
+    from app.core.object_storage import get_object_storage
 
-    minio = get_minio_client()
+    object_storage = get_object_storage()
     rows: list[tuple[str, str]] = []
 
     for task in tasks:
@@ -488,7 +488,7 @@ def _parse_classify_tasks(tasks: list[dict], images_dir: Path) -> list[tuple[str
                 continue
             bucket_name, key = parts
             try:
-                minio.fget_object(bucket_name, key, str(dest))
+                object_storage.download_file(bucket_name, key, dest)
             except Exception as exc:
                 logger.warning("Failed to download %s: %s", image_url, exc)
                 continue
@@ -524,7 +524,7 @@ def export_csv_dataset(
     release_name: str | None = None,
 ) -> dict:
     """Export reviewed Choices annotations from a Label Studio project as a CSV
-    dataset (filename,label) with images and upload to the MinIO training bucket.
+    dataset (filename,label) with images and upload to the S3-compatible object storage training bucket.
     """
     headers = _resolve_auth_headers()
     release_name = release_name or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -561,7 +561,7 @@ def export_csv_dataset(
         r.raise_for_status()
         tasks: list[dict] = r.json()
 
-    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    bucket = settings.S3_TRAINING_BUCKET
     project_slug = project_title.lower().replace(" ", "-")
     release_prefix = f"datasets/releases/{project_slug}/{release_name}"
 
@@ -593,7 +593,9 @@ def export_csv_dataset(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
 
-        uploaded_files = _upload_directory_to_minio(extract_dir, bucket, release_prefix)
+        uploaded_files = _upload_directory_to_object_storage(
+            extract_dir, bucket, release_prefix
+        )
 
     return {
         "project_id": pid,
@@ -612,14 +614,14 @@ def export_yolo_dataset(
     release_name: str | None = None,
 ) -> dict:
     """Export reviewed annotations from a Label Studio project as a YOLO
-    dataset and upload the result to the MinIO training bucket.
+    dataset and upload the result to the S3-compatible object storage training bucket.
 
     Steps:
         1. Find project by title
         2. Create export snapshot (reviewed annotations only)
         3. Convert to "YOLO with Images"
         4. Download the zip
-        5. Extract, generate dataset.yaml, upload to MinIO
+        5. Extract, generate dataset.yaml, upload to S3-compatible object storage
 
     Raises httpx.ConnectError if Label Studio is unreachable.
     """
@@ -663,8 +665,8 @@ def export_yolo_dataset(
         r.raise_for_status()
         archive_bytes = r.content
 
-    # 5. Extract and upload to MinIO
-    bucket = settings.ML_MINIO_TRAINING_BUCKET_NAME
+    # 5. Extract and upload to S3-compatible object storage
+    bucket = settings.S3_TRAINING_BUCKET
     # Use project title as slug (safe for paths)
     project_slug = project_title.lower().replace(" ", "-")
     release_prefix = f"datasets/releases/{project_slug}/{release_name}"
@@ -705,7 +707,9 @@ def export_yolo_dataset(
             encoding="utf-8",
         )
 
-        uploaded_files = _upload_directory_to_minio(extract_dir, bucket, release_prefix)
+        uploaded_files = _upload_directory_to_object_storage(
+            extract_dir, bucket, release_prefix
+        )
 
     return {
         "project_id": pid,

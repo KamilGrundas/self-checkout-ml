@@ -36,8 +36,10 @@ class KerasRegistryModelStore:
         from mlflow.tracking import MlflowClient
 
         configure_local_caches()
-        mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
-        self._client = MlflowClient(tracking_uri=settings.MLFLOW_TRACKING_URI)
+        self._client: Any | None = None
+        if settings.MLFLOW_TRACKING_URI:
+            mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
+            self._client = MlflowClient(tracking_uri=settings.MLFLOW_TRACKING_URI)
         self._registered_model_name = registered_model_name
         self._cache_prefix = cache_prefix
         self._cached_cache_key: str | None = None
@@ -47,6 +49,14 @@ class KerasRegistryModelStore:
         self._refresh_lock = threading.Lock()
         self._cache_dir = Path(settings.MODEL_CACHE_DIR)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="MLflow is disabled because MLFLOW_TRACKING_URI is not configured.",
+            )
+        return self._client
 
     def _disk_model_path(self) -> Path:
         return self._cache_dir / f"{self._cache_prefix}.keras"
@@ -111,7 +121,7 @@ class KerasRegistryModelStore:
 
         try:
             versions = list(
-                self._client.search_model_versions(
+                self._require_client().search_model_versions(
                     f"name='{self._registered_model_name}'"
                 )
             )
@@ -203,7 +213,7 @@ class KerasRegistryModelStore:
 
         try:
             versions = list(
-                self._client.search_model_versions(
+                self._require_client().search_model_versions(
                     f"name='{self._registered_model_name}'"
                 )
             )
@@ -258,7 +268,7 @@ class KerasRegistryModelStore:
 
             # Not on disk — fetch from MLflow registry
             try:
-                target = self._client.get_model_version(
+                target = self._require_client().get_model_version(
                     self._registered_model_name, str(version)
                 )
             except MlflowException as error:

@@ -1,7 +1,14 @@
 from typing import Annotated, Any
 
-from pydantic import AnyUrl, BeforeValidator, computed_field
+from pydantic import (
+    AnyHttpUrl,
+    AnyUrl,
+    BeforeValidator,
+    computed_field,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
 
 
 def parse_cors(v: Any) -> list[str] | str:
@@ -27,17 +34,25 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGINS: Annotated[
         list[AnyUrl] | str, BeforeValidator(parse_cors)
     ] = []
-    MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "minioadmin"
-    MINIO_SECRET_KEY: str = "minioadmin"
-    MINIO_PUBLIC_URL: str = "http://localhost:9000"
-    MINIO_USE_SSL: bool = False
-    ML_MINIO_SHELF_BUCKET_NAME: str = "session-images"
-    ML_MINIO_SCALE_BUCKET_NAME: str = "scale-images"
-    ML_MINIO_EXTERNAL_BUCKET_NAME: str = "uploaded-images"
-    ML_MINIO_TRAINING_BUCKET_NAME: str = "training-data"
-    ML_MINIO_LABELSTUDIO_EXPORT_BUCKET_NAME: str = "labelstudio-exports"
-    MLFLOW_TRACKING_URI: str = "http://127.0.0.1:5002"
+    S3_ENDPOINT_URL: AnyHttpUrl | None = None
+    S3_REGION: str = "us-east-1"
+    S3_ACCESS_KEY_ID: str | None = None
+    S3_SECRET_ACCESS_KEY: str | None = None
+    S3_SESSION_TOKEN: str | None = None
+    S3_USE_SSL: bool = False
+    S3_FORCE_PATH_STYLE: bool = True
+    S3_VERIFY_TLS: bool = True
+    S3_CONNECT_TIMEOUT: int = 5
+    S3_READ_TIMEOUT: int = 30
+    S3_MAX_RETRIES: int = 3
+    S3_CREATE_BUCKETS: bool = False
+    S3_PUBLIC_BASE_URL: AnyHttpUrl | None = None
+    S3_SHELF_BUCKET: str | None = None
+    S3_SCALE_BUCKET: str | None = None
+    S3_EXTERNAL_BUCKET: str | None = None
+    S3_TRAINING_BUCKET: str | None = None
+    S3_LABEL_STUDIO_EXPORT_BUCKET: str | None = None
+    MLFLOW_TRACKING_URI: str | None = None
     MLFLOW_EXPERIMENT_NAME: str = "self-checkout-classifier"
     MLFLOW_REGISTERED_MODEL_NAME: str = "self-checkout-classifier"
     MLFLOW_SHELF_EXPERIMENT_NAME: str = "self-checkout-shelf-classifier"
@@ -56,6 +71,43 @@ class Settings(BaseSettings):
         return [str(origin).rstrip("/") for origin in self.BACKEND_CORS_ORIGINS] + [
             self.FRONTEND_HOST
         ]
+
+    @model_validator(mode="after")
+    def _validate_external_services(self) -> Self:
+        is_local = self.ENVIRONMENT == "local"
+        defaults = {
+            "S3_SHELF_BUCKET": "session-images",
+            "S3_SCALE_BUCKET": "scale-images",
+            "S3_EXTERNAL_BUCKET": "uploaded-images",
+            "S3_TRAINING_BUCKET": "training-data",
+            "S3_LABEL_STUDIO_EXPORT_BUCKET": "labelstudio-exports",
+        }
+        if self.S3_ENDPOINT_URL is None:
+            if not is_local:
+                raise ValueError(
+                    "S3_ENDPOINT_URL is required outside local development"
+                )
+            self.S3_ENDPOINT_URL = AnyHttpUrl("http://localhost:8082")
+        for field, default in defaults.items():
+            if getattr(self, field) is None:
+                if not is_local:
+                    raise ValueError(f"{field} is required outside local development")
+                setattr(self, field, default)
+        if bool(self.S3_ACCESS_KEY_ID) != bool(self.S3_SECRET_ACCESS_KEY):
+            raise ValueError(
+                "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set together"
+            )
+        if self.S3_SESSION_TOKEN and not self.S3_ACCESS_KEY_ID:
+            raise ValueError("S3_SESSION_TOKEN requires S3 access credentials")
+        if self.S3_CREATE_BUCKETS and not is_local:
+            raise ValueError("S3_CREATE_BUCKETS is allowed only in local development")
+        if self.S3_ENDPOINT_URL.scheme == "https" and not self.S3_USE_SSL:
+            raise ValueError("S3_USE_SSL must be true for an https S3_ENDPOINT_URL")
+        if self.S3_ENDPOINT_URL.scheme == "http" and self.S3_USE_SSL:
+            raise ValueError("S3_USE_SSL must be false for an http S3_ENDPOINT_URL")
+        if self.MLFLOW_TRACKING_URI is None and is_local:
+            self.MLFLOW_TRACKING_URI = "http://127.0.0.1:5002"
+        return self
 
 
 settings = Settings()  # type: ignore
