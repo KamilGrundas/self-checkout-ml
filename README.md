@@ -1,12 +1,12 @@
 # self-checkout-ml
 
-`self-checkout-ml` stores raw checkout images in MinIO, exposes upload and
+`self-checkout-ml` stores raw checkout images in S3-compatible object storage, exposes upload and
 inference APIs, prepares local datasets, and integrates with Label Studio and
 MLflow.
 
 The current repository covers four areas:
 - FastAPI API for session snapshots and classifier inference
-- MinIO storage for raw shelf, scale, upload, and training-release data
+- S3-compatible object storage storage for raw shelf, scale, upload, and training-release data
 - local extraction and review pipeline
 - TensorFlow/Keras classifier training with MLflow logging
 - TensorFlow/Keras multilabel shelf classifier training with MLflow logging
@@ -14,7 +14,7 @@ The current repository covers four areas:
 
 ## Repository Layout
 
-- `app/` - FastAPI application, MinIO integration, inference loader
+- `app/` - FastAPI application, S3-compatible object storage integration, inference loader
 - `scripts/` - extraction, review, import, and reset utilities
 - `ml/datasets/` - local generated datasets and external images
 - `ml/manifests/` - local CSV manifests produced by the pipeline
@@ -24,23 +24,23 @@ The current repository covers four areas:
 
 ## Raw Snapshot Storage
 
-`ML_label` sessions are stored in MinIO as raw captures.
+`ML_label` sessions are stored in S3-compatible object storage as raw captures.
 
 Naming:
 - empty shelf baseline: `0000-empty.<ext>`
 - first labeled capture: `0001-product.<ext>`
 - second labeled capture: `0002-product.<ext>`
 
-MinIO object path:
+S3-compatible object storage object path:
 - `sessions/<session_id>/captures/<filename>`
 
 The extension depends on the uploaded image format, for example `.png` or `.jpg`.
 
 Additional raw buckets:
-- scale images: `ML_MINIO_SCALE_BUCKET_NAME`
-- manually uploaded images: `ML_MINIO_EXTERNAL_BUCKET_NAME`
-- Label Studio raw exports: `ML_MINIO_LABELSTUDIO_EXPORT_BUCKET_NAME`
-- built training releases: `ML_MINIO_TRAINING_BUCKET_NAME`
+- scale images: `S3_SCALE_BUCKET`
+- manually uploaded images: `S3_EXTERNAL_BUCKET`
+- Label Studio raw exports: `S3_LABEL_STUDIO_EXPORT_BUCKET`
+- built training releases: `S3_TRAINING_BUCKET`
 
 ## API
 
@@ -54,7 +54,7 @@ Additional raw buckets:
   - `product_id` optional
   - `product_name` optional
   - `file` required image
-- stores the snapshot in `ML_MINIO_SHELF_BUCKET_NAME`
+- stores the snapshot in `S3_SHELF_BUCKET`
 
 `GET /api/v1/checkout-sessions/{session_id}/shelf-snapshots`
 - returns ordered shelf snapshots for the session
@@ -66,7 +66,7 @@ Additional raw buckets:
   - `product_id` optional
   - `product_name` optional
   - `file` required image
-- stores the snapshot in `ML_MINIO_SCALE_BUCKET_NAME`
+- stores the snapshot in `S3_SCALE_BUCKET`
 
 `GET /api/v1/checkout-sessions/{session_id}/scale-snapshots`
 - returns ordered scale snapshots for the session
@@ -75,19 +75,19 @@ Additional raw buckets:
 - multipart form-data
 - field:
   - `files` required, multiple images
-- stores raw shelf images in `ML_MINIO_SHELF_BUCKET_NAME` under `raw/shelf/`
+- stores raw shelf images in `S3_SHELF_BUCKET` under `raw/shelf/`
 
 `POST /api/v1/datasets/scale-images`
 - multipart form-data
 - field:
   - `files` required, multiple images
-- stores raw scale images in `ML_MINIO_SCALE_BUCKET_NAME` under `raw/scale/`
+- stores raw scale images in `S3_SCALE_BUCKET` under `raw/scale/`
 
 `POST /api/v1/datasets/external-images`
 - multipart form-data
 - field:
   - `files` required, multiple images
-- stores raw uploaded images in `ML_MINIO_EXTERNAL_BUCKET_NAME` under `raw/uploaded/`
+- stores raw uploaded images in `S3_EXTERNAL_BUCKET` under `raw/uploaded/`
 
 Each snapshot item includes:
 - `capture_index`
@@ -193,7 +193,7 @@ uv run python scripts/extract_all_sessions.py \
   --manifest-path ml/manifests/extracted_objects.csv
 ```
 
-If `--limit` is omitted, the script processes all sessions it discovers in MinIO.
+If `--limit` is omitted, the script processes all sessions it discovers in S3-compatible object storage.
 
 The extraction manifest stores:
 - `file_path`
@@ -249,7 +249,7 @@ This creates:
 
 This local folder-based flow is still supported, but the preferred cloud flow is:
 - upload raw images to `POST /api/v1/datasets/external-images`
-- annotate them in Label Studio from MinIO source storage
+- annotate them in Label Studio from S3-compatible object storage source storage
 - export a reviewed release with `scripts/build_dataset.py`
 
 ## Training
@@ -258,7 +258,7 @@ The current baseline trainer lives in `train/train_classifier/` and uses stable
 TensorFlow with Keras. The model is logged directly to MLflow through the Keras
 flavor and is not stored locally as the source of truth.
 
-Training is triggered via `POST /api/v1/train/classifier` with MinIO dataset prefixes:
+Training is triggered via `POST /api/v1/train/classifier` with S3-compatible object storage dataset prefixes:
 
 ```json
 {
@@ -347,7 +347,7 @@ cd /Users/kamilgrundas/Repositories/self-checkout/self-checkout-infra
 
 `label-studio-init` automatically:
 - creates or updates the `scale-products`, `shelf-products`, and `external-products` projects
-- connects `scale-images`, `uploaded-images`, and `session-images` MinIO buckets
+- connects `scale-images`, `uploaded-images`, and `session-images` S3-compatible object storage buckets
 - connects a raw export bucket for Label Studio snapshot exports
 
 Project labeling schema:
@@ -364,7 +364,7 @@ Default local endpoint:
 ## Build Dataset
 
 `POST /api/v1/label-studio/export` creates a reviewed export snapshot in Label
-Studio and uploads the release to the training bucket in MinIO.
+Studio and uploads the release to the training bucket in S3-compatible object storage.
 
 The export format depends on the project:
 - `scale-products` → **CSV** (`dataset.csv` + `images/`) — whole images for classification
@@ -442,22 +442,22 @@ To also remove the local `uv` cache used in this repository:
 uv run python scripts/reset_local_data.py --include-cache
 ```
 
-This reset does not remove raw session snapshots stored in MinIO.
+This reset does not remove raw session snapshots stored in S3-compatible object storage.
 
 ## Configuration
 
 Copy `.env.example` to `.env`.
 
 Important variables:
-- `MINIO_ENDPOINT`
-- `MINIO_ACCESS_KEY`
-- `MINIO_SECRET_KEY`
-- `MINIO_PUBLIC_URL`
-- `ML_MINIO_SHELF_BUCKET_NAME`
-- `ML_MINIO_SCALE_BUCKET_NAME`
-- `ML_MINIO_EXTERNAL_BUCKET_NAME`
-- `ML_MINIO_TRAINING_BUCKET_NAME`
-- `ML_MINIO_LABELSTUDIO_EXPORT_BUCKET_NAME`
+- `S3_ENDPOINT_URL`
+- `S3_ACCESS_KEY_ID`
+- `S3_SECRET_ACCESS_KEY`
+- `S3_PUBLIC_BASE_URL`
+- `S3_SHELF_BUCKET`
+- `S3_SCALE_BUCKET`
+- `S3_EXTERNAL_BUCKET`
+- `S3_TRAINING_BUCKET`
+- `S3_LABEL_STUDIO_EXPORT_BUCKET`
 - `MLFLOW_TRACKING_URI`
 - `MLFLOW_REGISTERED_MODEL_NAME`
 - `MLFLOW_SHELF_MODEL_NAME`
@@ -479,7 +479,7 @@ For the shared local stack from `self-checkout-infra`, the relevant host endpoin
 - Label Studio: `http://127.0.0.1:8080`
 
 Inside Docker in the shared stack:
-- MinIO: `minio:9000`
+- S3-compatible object storage: `s3-provider:8080`
 - MLflow: `mlflow:5000`
 
 ## Python Version

@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.core.object_storage import (
     build_object_name,
     ensure_bucket_exists,
-    get_minio_client,
+    get_object_storage,
     public_object_url,
     store_session_snapshot,
 )
@@ -39,7 +39,7 @@ async def upload_scale_snapshot(
         filename=file.filename,
         content_type=file.content_type,
         data=data,
-        bucket_name=settings.ML_MINIO_SCALE_BUCKET_NAME,
+        bucket_name=settings.S3_SCALE_BUCKET,
     )
 
     return SessionSnapshotPublic(
@@ -49,7 +49,7 @@ async def upload_scale_snapshot(
         product_name=product_name,
         filename=filename,
         object_name=object_name,
-        image_url=public_object_url(object_name, settings.ML_MINIO_SCALE_BUCKET_NAME),
+        image_url=public_object_url(object_name, settings.S3_SCALE_BUCKET),
         content_type=file.content_type,
         size=len(data),
     )
@@ -61,14 +61,12 @@ async def upload_scale_snapshot(
     dependencies=[SuperuserDep],
 )
 def list_scale_snapshots(session_id: str) -> SessionSnapshotListPublic:
-    ensure_bucket_exists(settings.ML_MINIO_SCALE_BUCKET_NAME)
-    client = get_minio_client()
+    ensure_bucket_exists(settings.S3_SCALE_BUCKET)
+    client = get_object_storage()
     prefix = build_object_name(session_id, "")
     snapshots: list[SessionSnapshotPublic] = []
 
-    for obj in client.list_objects(
-        settings.ML_MINIO_SCALE_BUCKET_NAME, prefix=prefix, recursive=True
-    ):
+    for obj in client.list_objects(settings.S3_SCALE_BUCKET, prefix=prefix):
         filename = obj.object_name.rsplit("/", 1)[-1]
         capture_prefix = filename.split("-", 1)[0]
         if not capture_prefix.isdigit():
@@ -76,10 +74,10 @@ def list_scale_snapshots(session_id: str) -> SessionSnapshotListPublic:
 
         capture_index = int(capture_prefix)
         content_type = obj.content_type or "application/octet-stream"
-        stat = client.stat_object(settings.ML_MINIO_SCALE_BUCKET_NAME, obj.object_name)
+        stat = client.head_object(settings.S3_SCALE_BUCKET, obj.object_name)
         metadata = stat.metadata or {}
-        product_id = unquote(metadata.get("x-amz-meta-product-id") or "") or None
-        product_name = unquote(metadata.get("x-amz-meta-product-name") or "") or None
+        product_id = unquote(metadata.get("product-id") or "") or None
+        product_name = unquote(metadata.get("product-name") or "") or None
 
         snapshots.append(
             SessionSnapshotPublic(
@@ -89,9 +87,7 @@ def list_scale_snapshots(session_id: str) -> SessionSnapshotListPublic:
                 product_name=product_name,
                 filename=filename,
                 object_name=obj.object_name,
-                image_url=public_object_url(
-                    obj.object_name, settings.ML_MINIO_SCALE_BUCKET_NAME
-                ),
+                image_url=public_object_url(obj.object_name, settings.S3_SCALE_BUCKET),
                 content_type=content_type,
                 size=obj.size,
             )

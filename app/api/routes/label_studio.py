@@ -22,7 +22,7 @@ async def get_projects() -> list[dict]:
 
 @router.post("/sync")
 async def sync() -> dict:
-    """Sync MinIO images with Label Studio projects.
+    """Sync S3-compatible object storage images with Label Studio projects.
 
     Returns 503 if Label Studio is unreachable.
     """
@@ -42,7 +42,7 @@ async def export(
         default=None, description="Release name (defaults to timestamp)"
     ),
 ) -> dict:
-    """Export reviewed annotations as YOLO dataset and upload to MinIO.
+    """Export reviewed annotations as YOLO dataset and upload to S3-compatible object storage.
 
     Returns 503 if Label Studio is unreachable.
     """

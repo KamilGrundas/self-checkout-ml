@@ -47,7 +47,7 @@ async def upload_shelf_images(
 ) -> list[StoredImagePublic]:
     return [
         await _upload_raw_image(
-            bucket_name=settings.ML_MINIO_SHELF_BUCKET_NAME,
+            bucket_name=settings.S3_SHELF_BUCKET,
             prefix="raw/shelf",
             file=file,
         )
@@ -61,7 +61,7 @@ async def upload_scale_images(
 ) -> list[StoredImagePublic]:
     return [
         await _upload_raw_image(
-            bucket_name=settings.ML_MINIO_SCALE_BUCKET_NAME,
+            bucket_name=settings.S3_SCALE_BUCKET,
             prefix="raw/scale",
             file=file,
         )
@@ -75,7 +75,7 @@ async def upload_external_images(
 ) -> list[StoredImagePublic]:
     return [
         await _upload_raw_image(
-            bucket_name=settings.ML_MINIO_EXTERNAL_BUCKET_NAME,
+            bucket_name=settings.S3_EXTERNAL_BUCKET,
             prefix="raw/uploaded",
             file=file,
         )
