@@ -27,7 +27,12 @@ def test_production_accepts_external_s3_and_optional_mlflow() -> None:
         S3_LABEL_STUDIO_EXPORT_BUCKET="exports",
         S3_CREATE_BUCKETS=False,
         MLFLOW_TRACKING_URI=None,
+        TRAINING_QUEUE_URL="redis://queue.example.invalid:6379/0",
     )
 
     assert settings.MLFLOW_TRACKING_URI is None
     assert settings.S3_CREATE_BUCKETS is False
+
+
+def test_label_studio_api_key_is_not_an_environment_setting() -> None:
+    assert "LABEL_STUDIO_API_KEY" not in Settings.model_fields

@@ -1,17 +1,20 @@
-"""Train a Keras image classifier from YOLO and CSV datasets stored in S3-compatible object storage."""
+"""Train an image classifier from datasets stored in S3-compatible object storage."""
 
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import logging
 import tempfile
 from pathlib import Path
+from typing import Any, Callable
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+TrainingProgressCallback = Callable[[dict[str, object]], None]
+SKOPS_TRUSTED_TYPES = ["app.core.image_features.ProductImageFeatures"]
 
 
 def _download_datasets(prefixes: list[str], dest: Path) -> None:
@@ -233,50 +236,29 @@ def _merge_datasets(
 def _split_data(images: list, labels: list, val_ratio: float) -> tuple:
     import numpy as np
 
-    train_imgs, train_labels = [], []
-    val_imgs, val_labels = [], []
+    labels_array = np.asarray(labels, dtype=np.int32)
+    random = np.random.default_rng(42)
+    train_indices: list[int] = []
+    val_indices: list[int] = []
 
-    for i, (img, label) in enumerate(zip(images, labels)):
-        h = int(hashlib.sha1(str(i).encode()).hexdigest(), 16) % 100
-        if h < int(val_ratio * 100):
-            val_imgs.append(img)
-            val_labels.append(label)
-        else:
-            train_imgs.append(img)
-            train_labels.append(label)
+    for label in sorted(set(labels)):
+        class_indices = np.flatnonzero(labels_array == label)
+        random.shuffle(class_indices)
+        desired_validation = int(round(len(class_indices) * val_ratio))
+        validation_count = min(desired_validation, max(0, len(class_indices) - 1))
+        val_indices.extend(class_indices[:validation_count].tolist())
+        train_indices.extend(class_indices[validation_count:].tolist())
 
     return (
-        np.stack(train_imgs) if train_imgs else np.empty((0,)),
-        np.array(train_labels, dtype=np.int32),
-        np.stack(val_imgs) if val_imgs else np.empty((0,)),
-        np.array(val_labels, dtype=np.int32),
+        np.stack([images[index] for index in train_indices]),
+        labels_array[train_indices],
+        (
+            np.stack([images[index] for index in val_indices])
+            if val_indices
+            else np.empty((0,))
+        ),
+        labels_array[val_indices],
     )
-
-
-def _build_model(image_size: int, num_classes: int):
-    import tensorflow as tf
-
-    model = tf.keras.Sequential(
-        [
-            tf.keras.layers.Input(shape=(image_size, image_size, 3)),
-            tf.keras.layers.Conv2D(32, 3, activation="relu"),
-            tf.keras.layers.MaxPooling2D(),
-            tf.keras.layers.Conv2D(64, 3, activation="relu"),
-            tf.keras.layers.MaxPooling2D(),
-            tf.keras.layers.Conv2D(128, 3, activation="relu"),
-            tf.keras.layers.MaxPooling2D(),
-            tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(128, activation="relu"),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(num_classes, activation="softmax"),
-        ]
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    return model
 
 
 def check_mlflow() -> None:
@@ -297,6 +279,100 @@ def check_mlflow() -> None:
         ) from exc
 
 
+def _fit_classifier(
+    x_train: Any,
+    y_train: Any,
+    x_val: Any,
+    y_val: Any,
+    *,
+    num_classes: int,
+    epochs: int,
+    batch_size: int,
+    epoch_callback: Callable[[int, dict[str, float]], None] | None = None,
+) -> tuple[Any, dict[str, float]]:
+    import numpy as np
+    from sklearn.linear_model import SGDClassifier
+    from sklearn.metrics import accuracy_score, log_loss
+    from sklearn.pipeline import Pipeline
+
+    from app.core.image_features import ProductImageFeatures
+
+    x_train_flat = x_train.reshape(len(x_train), -1)
+    has_val = len(x_val) > 0
+    x_val_flat = x_val.reshape(len(x_val), -1) if has_val else x_val
+    image_size = x_train.shape[1]
+    feature_transformer = ProductImageFeatures(image_size=image_size)
+    x_train_features = feature_transformer.fit_transform(x_train_flat)
+    x_val_features = (
+        feature_transformer.transform(x_val_flat) if has_val else x_val_flat
+    )
+    classes = np.arange(num_classes, dtype=np.int32)
+    classifier = SGDClassifier(
+        loss="log_loss",
+        random_state=42,
+        alpha=0.001,
+        learning_rate="adaptive",
+        eta0=0.01,
+        average=True,
+    )
+
+    counts = np.bincount(y_train, minlength=num_classes)
+    total = counts.sum()
+    class_weight = {
+        i: total / (num_classes * count) if count > 0 else 1.0
+        for i, count in enumerate(counts)
+    }
+    logger.info(
+        "Class distribution: %s, weights: %s", dict(enumerate(counts)), class_weight
+    )
+
+    random = np.random.default_rng(42)
+    first_batch = True
+    last_metrics: dict[str, float] = {}
+    for epoch in range(epochs):
+        indices = random.permutation(len(x_train_features))
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start : start + batch_size]
+            batch_y = y_train[batch_indices]
+            sample_weight = np.array(
+                [class_weight[int(label)] for label in batch_y],
+                dtype=np.float64,
+            )
+            classifier.partial_fit(
+                x_train_features[batch_indices],
+                batch_y,
+                classes=classes if first_batch else None,
+                sample_weight=sample_weight,
+            )
+            first_batch = False
+
+        train_probabilities = classifier.predict_proba(x_train_features)
+        last_metrics = {
+            "accuracy": float(
+                accuracy_score(y_train, classifier.predict(x_train_features))
+            ),
+            "loss": float(log_loss(y_train, train_probabilities, labels=classes)),
+        }
+        if has_val:
+            validation_probabilities = classifier.predict_proba(x_val_features)
+            last_metrics["val_accuracy"] = float(
+                accuracy_score(y_val, classifier.predict(x_val_features))
+            )
+            last_metrics["val_loss"] = float(
+                log_loss(y_val, validation_probabilities, labels=classes)
+            )
+        if epoch_callback:
+            epoch_callback(epoch + 1, last_metrics)
+
+    model = Pipeline(
+        [
+            ("image_features", feature_transformer),
+            ("classifier", classifier),
+        ]
+    )
+    return model, last_metrics
+
+
 def train_classifier(
     yolo_datasets: list[str],
     csv_datasets: list[str] | None = None,
@@ -305,24 +381,41 @@ def train_classifier(
     epochs: int = 12,
     batch_size: int = 16,
     validation_ratio: float = 0.2,
+    progress_callback: TrainingProgressCallback | None = None,
 ) -> dict:
     """Train a classifier from YOLO datasets (crops) and/or CSV datasets (whole images)
     stored in S3-compatible object storage and register the result in MLflow.
     """
     import os
 
-    import numpy as np
-
     import mlflow
-    import mlflow.keras
-    import tensorflow as tf
+    import mlflow.sklearn
     from mlflow.models import infer_signature
 
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "10")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "120")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
 
+    def report(
+        stage: str,
+        message: str,
+        progress: float,
+        *,
+        current_epoch: int | None = None,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": stage,
+                    "message": message,
+                    "progress": progress,
+                    "current_epoch": current_epoch,
+                    "total_epochs": epochs,
+                    "metrics": metrics,
+                }
+            )
+
     check_mlflow()
-    tf.random.set_seed(42)
 
     model_name = settings.MLFLOW_REGISTERED_MODEL_NAME
 
@@ -330,62 +423,59 @@ def train_classifier(
         groups = []
 
         if yolo_datasets:
+            report("downloading", "Downloading YOLO datasets", 5)
             yolo_dir = Path(tmp) / "yolo"
             _download_datasets(yolo_datasets, yolo_dir)
+            report("loading", "Loading YOLO images and annotations", 12)
             groups.append(_load_yolo_dataset(yolo_dir, image_size))
 
         if csv_datasets:
+            report("downloading", "Downloading CSV datasets", 5)
             csv_dir = Path(tmp) / "csv"
             _download_csv_datasets(csv_datasets, csv_dir)
+            report("loading", "Loading CSV images and labels", 12)
             groups.append(_load_csv_dataset(csv_dir, image_size))
 
         if not groups:
             raise ValueError("No datasets provided")
 
+        report("preparing", "Preparing training and validation data", 20)
         images, labels, class_names = _merge_datasets(*groups)
 
     if len(images) < 2:
         raise ValueError(f"Need at least 2 samples, got {len(images)}")
+    if len(class_names) < 2 or len(set(labels)) < 2:
+        raise ValueError(f"Need at least 2 represented classes, got {len(set(labels))}")
 
     logger.info(
         "Loaded %d samples, %d classes: %s", len(images), len(class_names), class_names
     )
 
     x_train, y_train, x_val, y_val = _split_data(images, labels, validation_ratio)
-
-    model = _build_model(image_size, len(class_names))
     has_val = len(x_val) > 0
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_accuracy" if has_val else "accuracy",
-            patience=3,
-            restore_best_weights=True,
+    x_train_flat = x_train.reshape(len(x_train), -1)
+
+    report("training", f"Starting epoch 1 of {epochs}", 25, current_epoch=0)
+
+    def report_epoch(current_epoch: int, metrics: dict[str, float]) -> None:
+        report(
+            "training",
+            f"Completed epoch {current_epoch} of {epochs}",
+            25 + (current_epoch / epochs) * 60,
+            current_epoch=current_epoch,
+            metrics=metrics,
         )
-    ]
-    # Compute class weights to handle imbalanced classes
-    counts = np.bincount(y_train, minlength=len(class_names))
-    total = counts.sum()
-    class_weight = {
-        i: total / (len(class_names) * c) if c > 0 else 1.0
-        for i, c in enumerate(counts)
-    }
-    logger.info(
-        "Class distribution: %s, weights: %s", dict(enumerate(counts)), class_weight
+
+    model, last_metrics = _fit_classifier(
+        x_train,
+        y_train,
+        x_val,
+        y_val,
+        num_classes=len(class_names),
+        epochs=epochs,
+        batch_size=batch_size,
+        epoch_callback=report_epoch,
     )
-
-    fit_kwargs: dict = {
-        "x": x_train,
-        "y": y_train,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "callbacks": callbacks,
-        "class_weight": class_weight,
-        "verbose": 1,
-    }
-    if has_val:
-        fit_kwargs["validation_data"] = (x_val, y_val)
-
-    history = model.fit(**fit_kwargs)
 
     result: dict = {
         "train_samples": int(len(x_train)),
@@ -393,15 +483,16 @@ def train_classifier(
         "num_classes": len(class_names),
         "classes": class_names,
         "image_size": image_size,
-        "epochs_ran": len(history.history["loss"]),
+        "epochs_ran": epochs,
         "yolo_datasets": yolo_datasets,
         "csv_datasets": csv_datasets or [],
     }
     if has_val:
-        loss, acc = model.evaluate(x_val, y_val, verbose=0)
-        result["val_loss"] = float(loss)
-        result["val_accuracy"] = float(acc)
+        report("evaluating", "Evaluating the trained model", 88)
+        result["val_loss"] = last_metrics["val_loss"]
+        result["val_accuracy"] = last_metrics["val_accuracy"]
 
+    report("registering", "Saving the model in MLflow", 92)
     mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
     mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
 
@@ -409,7 +500,7 @@ def train_classifier(
         mlflow.set_tags(
             {
                 "pipeline": "train_classifier",
-                "framework": "tensorflow",
+                "framework": "scikit-learn",
                 "datasets": ",".join(yolo_datasets),
             }
         )
@@ -426,15 +517,16 @@ def train_classifier(
             {k: v for k, v in result.items() if isinstance(v, (int, float))}
         )
 
-        input_example = x_train[:1]
+        input_example = x_train_flat[:1]
         signature = infer_signature(
             input_example,
-            model.predict(input_example, verbose=0),
+            model.predict_proba(input_example),
         )
-        mlflow.keras.log_model(
+        mlflow.sklearn.log_model(
             model,
             name=model_name,
             registered_model_name=model_name,
+            skops_trusted_types=SKOPS_TRUSTED_TYPES,
             signature=signature,
             metadata={
                 "labels": class_names,

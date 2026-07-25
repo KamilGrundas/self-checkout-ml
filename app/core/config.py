@@ -58,9 +58,9 @@ class Settings(BaseSettings):
     MLFLOW_SHELF_EXPERIMENT_NAME: str = "self-checkout-shelf-classifier"
     MLFLOW_SHELF_MODEL_NAME: str = "self-checkout-shelf-classifier"
     MODEL_CACHE_DIR: str = ".cache/model_store"
+    TRAINING_QUEUE_URL: str | None = None
     BACKEND_URL: str = "http://127.0.0.1:8000"
     LABEL_STUDIO_URL: str = "http://127.0.0.1:8080"
-    LABEL_STUDIO_API_KEY: str = ""
     LABEL_STUDIO_SCALE_PROJECT_TITLE: str = "scale-products"
     LABEL_STUDIO_SHELF_PROJECT_TITLE: str = "shelf-products"
     LABEL_STUDIO_EXTERNAL_PROJECT_TITLE: str = "external-products"
@@ -107,6 +107,12 @@ class Settings(BaseSettings):
             raise ValueError("S3_USE_SSL must be false for an http S3_ENDPOINT_URL")
         if self.MLFLOW_TRACKING_URI is None and is_local:
             self.MLFLOW_TRACKING_URI = "http://127.0.0.1:5002"
+        if self.TRAINING_QUEUE_URL is None:
+            if not is_local:
+                raise ValueError(
+                    "TRAINING_QUEUE_URL is required outside local development"
+                )
+            self.TRAINING_QUEUE_URL = "redis://127.0.0.1:6379/0"
         return self
 
 

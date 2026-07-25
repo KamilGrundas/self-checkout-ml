@@ -25,7 +25,7 @@ def configure_local_caches() -> None:
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
 
 
-class KerasRegistryModelStore:
+class RegistryModelStore:
     def __init__(
         self,
         *,
@@ -46,6 +46,7 @@ class KerasRegistryModelStore:
         self._cached_run_id: str | None = None
         self._cached_model: Any | None = None
         self._cached_labels: list[str] | None = None
+        self._cached_image_size: int | None = None
         self._refresh_lock = threading.Lock()
         self._cache_dir = Path(settings.MODEL_CACHE_DIR)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -59,7 +60,7 @@ class KerasRegistryModelStore:
         return self._client
 
     def _disk_model_path(self) -> Path:
-        return self._cache_dir / f"{self._cache_prefix}.keras"
+        return self._cache_dir / f"{self._cache_prefix}.pkl"
 
     def _disk_metadata_path(self) -> Path:
         return self._cache_dir / f"{self._cache_prefix}_metadata.json"
@@ -72,8 +73,11 @@ class KerasRegistryModelStore:
         run_id: str,
         registered_model_name: str,
         registered_model_version: str,
+        image_size: int,
     ) -> None:
-        model.save(self._disk_model_path())
+        import joblib
+
+        joblib.dump(model, self._disk_model_path())
         self._disk_metadata_path().write_text(
             json.dumps(
                 {
@@ -81,15 +85,15 @@ class KerasRegistryModelStore:
                     "run_id": run_id,
                     "registered_model_name": registered_model_name,
                     "registered_model_version": registered_model_version,
+                    "image_size": image_size,
+                    "model_flavor": "sklearn",
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
 
-    def _load_from_disk_cache(self) -> tuple[Any, list[str], str] | None:
-        import tensorflow as tf
-
+    def _load_from_disk_cache(self) -> tuple[Any, list[str], str, int] | None:
         model_path = self._disk_model_path()
         metadata_path = self._disk_metadata_path()
         if not model_path.exists() or not metadata_path.exists():
@@ -100,21 +104,26 @@ class KerasRegistryModelStore:
         run_id = metadata.get("run_id")
         registered_model_name = metadata.get("registered_model_name")
         registered_model_version = metadata.get("registered_model_version")
+        image_size = metadata.get("image_size")
         if (
             not isinstance(labels, list)
             or not labels
             or not isinstance(run_id, str)
             or not isinstance(registered_model_name, str)
             or not isinstance(registered_model_version, str)
+            or not isinstance(image_size, int)
         ):
             return None
 
-        model = tf.keras.models.load_model(model_path)
+        import joblib
+
+        model = joblib.load(model_path)
         self._cached_run_id = run_id
         self._cached_cache_key = f"{registered_model_name}:{registered_model_version}"
         self._cached_model = model
         self._cached_labels = labels
-        return model, labels, run_id
+        self._cached_image_size = image_size
+        return model, labels, run_id, image_size
 
     def _latest_registered_model(self) -> ModelVersion:
         from mlflow.exceptions import MlflowException
@@ -144,8 +153,7 @@ class KerasRegistryModelStore:
 
     def _load_from_registry(
         self, latest_version: ModelVersion
-    ) -> tuple[Any, list[str]]:
-        import mlflow.keras
+    ) -> tuple[Any, list[str], int]:
         from mlflow.models import get_model_info
 
         model_uri = f"models:/{latest_version.name}/{latest_version.version}"
@@ -155,29 +163,40 @@ class KerasRegistryModelStore:
             labels = metadata.get("labels")
             if not isinstance(labels, list) or not labels:
                 raise ValueError("Missing labels in MLflow model metadata")
-            model = mlflow.keras.load_model(model_uri)
+            image_size = metadata.get("image_size")
+            if not isinstance(image_size, int):
+                raise ValueError("Missing image size in MLflow model metadata")
+            import mlflow.sklearn
+
+            model = mlflow.sklearn.load_model(model_uri)
         except Exception as error:
             raise HTTPException(
                 status_code=503,
                 detail=f"Failed to load model from MLflow: {type(error).__name__}: {error}",
             ) from error
-        return model, labels
+        return model, labels, image_size
 
-    def _ensure_loaded(self) -> tuple[Any, list[str], str]:
+    def _ensure_loaded(self) -> tuple[Any, list[str], str, int]:
         if (
             self._cached_model is not None
             and self._cached_labels
             and self._cached_run_id
             and self._cached_cache_key
+            and self._cached_image_size
         ):
-            return self._cached_model, self._cached_labels, self._cached_run_id
+            return (
+                self._cached_model,
+                self._cached_labels,
+                self._cached_run_id,
+                self._cached_image_size,
+            )
 
         disk_cached = self._load_from_disk_cache()
         if disk_cached is not None:
             return disk_cached
 
         latest_version = self._latest_registered_model()
-        model, labels = self._load_from_registry(latest_version)
+        model, labels, image_size = self._load_from_registry(latest_version)
 
         self._write_disk_cache(
             model=model,
@@ -185,12 +204,14 @@ class KerasRegistryModelStore:
             run_id=latest_version.run_id,
             registered_model_name=latest_version.name,
             registered_model_version=latest_version.version,
+            image_size=image_size,
         )
         self._cached_cache_key = f"{latest_version.name}:{latest_version.version}"
         self._cached_run_id = latest_version.run_id
         self._cached_model = model
         self._cached_labels = labels
-        return model, labels, latest_version.run_id
+        self._cached_image_size = image_size
+        return model, labels, latest_version.run_id, image_size
 
     def _active_cache_key(self) -> str | None:
         if self._cached_cache_key:
@@ -279,7 +300,7 @@ class KerasRegistryModelStore:
                     else f"MLflow error: {type(error).__name__}: {error}",
                 ) from error
             try:
-                model, labels = self._load_from_registry(target)
+                model, labels, image_size = self._load_from_registry(target)
             except HTTPException:
                 raise
             except Exception as error:
@@ -295,11 +316,13 @@ class KerasRegistryModelStore:
                 run_id=target.run_id,
                 registered_model_name=target.name,
                 registered_model_version=target.version,
+                image_size=image_size,
             )
             self._cached_cache_key = cache_key
             self._cached_run_id = target.run_id
             self._cached_model = model
             self._cached_labels = labels
+            self._cached_image_size = image_size
 
             return {
                 "model_name": target.name,
@@ -312,7 +335,7 @@ class KerasRegistryModelStore:
         import cv2
         import numpy as np
 
-        model, labels, run_id = self._ensure_loaded()
+        model, labels, run_id, image_size = self._ensure_loaded()
 
         array = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(array, cv2.IMREAD_COLOR)
@@ -320,16 +343,14 @@ class KerasRegistryModelStore:
             raise HTTPException(status_code=400, detail="Invalid image file")
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        _, image_height, image_width, _ = model.input_shape
         resized = cv2.resize(
             rgb,
-            (image_width, image_height),
+            (image_size, image_size),
             interpolation=cv2.INTER_AREA,
         )
         normalized = resized.astype(np.float32) / 255.0
         batch = np.expand_dims(normalized, axis=0)
-
-        probabilities = model.predict(batch, verbose=0)[0]
+        probabilities = model.predict_proba(batch.reshape(1, -1))[0]
         scores = dict(
             sorted(
                 (
@@ -343,12 +364,12 @@ class KerasRegistryModelStore:
         return scores, run_id
 
 
-classifier_model_store = KerasRegistryModelStore(
+classifier_model_store = RegistryModelStore(
     registered_model_name=settings.MLFLOW_REGISTERED_MODEL_NAME,
     cache_prefix="classifier_model",
 )
 
-shelf_model_store = KerasRegistryModelStore(
+shelf_model_store = RegistryModelStore(
     registered_model_name=settings.MLFLOW_SHELF_MODEL_NAME,
     cache_prefix="shelf_model",
 )
