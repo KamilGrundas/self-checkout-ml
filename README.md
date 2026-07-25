@@ -4,12 +4,11 @@
 inference APIs, prepares local datasets, and integrates with Label Studio and
 MLflow.
 
-The current repository covers four areas:
+The current repository covers:
 - FastAPI API for session snapshots and classifier inference
 - S3-compatible object storage storage for raw shelf, scale, upload, and training-release data
 - local extraction and review pipeline
-- TensorFlow/Keras classifier training with MLflow logging
-- TensorFlow/Keras multilabel shelf classifier training with MLflow logging
+- durable Redis/RQ product-classifier training with MLflow logging
 - Label Studio export-to-bucket dataset build script
 
 ## Repository Layout
@@ -19,8 +18,9 @@ The current repository covers four areas:
 - `ml/datasets/` - local generated datasets and external images
 - `ml/manifests/` - local CSV manifests produced by the pipeline
 - `ml/reports/` - optional local analysis outputs
-- `train/train_classifier/` - current TensorFlow/Keras baseline classifier trainer
-- `train/train_detector/` - current multilabel shelf classifier trainer
+- `app/core/training.py` - scikit-learn classifier training pipeline
+- `app/core/training_queue.py` - durable Redis/RQ queue integration
+- `app/core/training_worker.py` - worker entry point and persisted progress updates
 
 ## Raw Snapshot Storage
 
@@ -254,9 +254,11 @@ This local folder-based flow is still supported, but the preferred cloud flow is
 
 ## Training
 
-The current baseline trainer lives in `train/train_classifier/` and uses stable
-TensorFlow with Keras. The model is logged directly to MLflow through the Keras
-flavor and is not stored locally as the source of truth.
+The product classifier uses a scikit-learn pipeline with HOG, colour-histogram,
+and coarse spatial image features. Training runs in a dedicated RQ worker, and
+job state and progress survive an ML API restart. The model is logged directly
+to MLflow through the scikit-learn flavor and is not stored locally as the
+source of truth.
 
 Training is triggered via `POST /api/v1/train/classifier` with S3-compatible object storage dataset prefixes:
 
@@ -276,7 +278,9 @@ Training is triggered via `POST /api/v1/train/classifier` with S3-compatible obj
 
 Both dataset types can be combined in a single training run. Class indices are unified across all sources before training.
 
-The trainer stores the model directly in MLflow Model Registry and keeps label order in MLflow model metadata.
+The trainer stores the model directly in MLflow Model Registry and keeps label
+order in MLflow model metadata. Registering a candidate does not activate it;
+activation remains an explicit operation through the model-version API.
 
 MLflow logging includes:
 - parameters
@@ -300,31 +304,6 @@ Each logged dataset row includes dataset provenance, including:
 - `session_id`
 - `capture_index`
 - `file_path`
-
-## Shelf Classifier Training
-
-The shelf classifier lives in `train/train_detector/` and trains a multilabel
-Keras model for the whole shelf image.
-
-It uses:
-- cumulative full-scene shelf snapshots derived from `source_image_curr`
-- optional external one-label images for additional support per class
-
-Typical command:
-
-```bash
-uv run python -m train.train_detector.train \
-  --manifest-path ml/manifests/extracted_objects.csv \
-  --external-manifest ml/manifests/external_objects.csv \
-  --external-dataset-root ml/datasets/external \
-  --mlflow-tracking-uri http://127.0.0.1:5002
-```
-
-The shelf trainer:
-- caches downloaded shelf source images under `ml/datasets/shelf/source_images/`
-- trains a multilabel classifier with sigmoid outputs
-- logs datasets, reports, and the registered Keras model to MLflow
-- registers the trained model as `self-checkout-shelf-classifier` in MLflow Model Registry
 
 ## Label Studio
 
@@ -365,8 +344,8 @@ Default local endpoint:
 
 `POST /api/v1/label-studio/export` creates a reviewed export snapshot in Label
 Studio and uploads the release to the training bucket in S3-compatible object
-storage. All `/api/v1/label-studio/*` endpoints require the Label Studio personal
-access token in the `X-Label-Studio-Api-Key` request header.
+storage. The authenticated superuser's saved Label Studio personal access token
+is loaded from the backend for each operation.
 
 The export format depends on the project:
 - `scale-products` → **CSV** (`dataset.csv` + `images/`) — whole images for classification
@@ -400,21 +379,13 @@ cd /Users/kamilgrundas/Repositories/self-checkout/self-checkout-infra
 ./scripts/up-ml-dev.sh
 ```
 
-The default local stack does not start `ml-dev` automatically. `./scripts/up.sh`
-keeps the main stack running and stops `mlflow` and `label-studio` if they were started earlier.
+For local MLflow access from the host machine, use
+`http://127.0.0.1:5002`. The ML API and worker use `http://mlflow:5000`
+inside the shared Compose stack.
 
-For local training from the host machine, use:
-- `http://127.0.0.1:5002`
-
-For `self-checkout-ml` running inside Docker in the shared infra stack, use:
-- `http://mlflow:5000`
-
-You can override the tracking URI explicitly:
-
-```bash
-uv run python train/train_classifier/train.py \
-  --mlflow-tracking-uri http://127.0.0.1:5002
-```
+Submit training through `POST /api/v1/train/classifier`; the API queues the
+request and the dedicated RQ worker executes it. Poll
+`GET /api/v1/train/{job_id}` for durable progress and the final result.
 
 If you see an error like `403` while the trainer tries to create or read an
 experiment, it usually means the tracking URI points to the wrong service or to
@@ -463,14 +434,15 @@ Important variables:
 - `MLFLOW_TRACKING_URI`
 - `MLFLOW_REGISTERED_MODEL_NAME`
 - `MLFLOW_SHELF_MODEL_NAME`
+- `TRAINING_QUEUE_URL`
 - `LABEL_STUDIO_URL`
 - `BACKEND_URL`
 
-The Label Studio personal access token is supplied by an authenticated
-superuser through the admin UI for each browser session. The ML service does
-not read or persist it in configuration. It exchanges the request header value
-through `/api/token/refresh` when required and uses the returned Bearer access
-token only for the current operation.
+The Label Studio personal access token is saved for the authenticated
+superuser through the admin UI. The backend encrypts it at rest and does not
+include it in the public user profile. The ML service loads it from the backend
+for the current authenticated operation, exchanges it through
+`/api/token/refresh` when required, and does not persist it locally.
 
 `BACKEND_URL` points to the backend API used to fetch product names as Label
 Studio labels during sync. In Docker it is set to `http://backend:8000` directly
@@ -484,17 +456,17 @@ For the shared local stack from `self-checkout-infra`, the relevant host endpoin
 Inside Docker in the shared stack:
 - S3-compatible object storage: `s3-provider:8080`
 - MLflow: `mlflow:5000`
+- Redis/RQ: `redis:6379`
 
 ## Python Version
 
-The repository is pinned to Python `3.13.14` via `.python-version`. Python 3.14
-is not yet supported because TensorFlow 2.21 does not publish CPython 3.14
-wheels. Re-evaluate the runtime after TensorFlow publishes `cp314` Linux
-wheels for a stable release.
+The repository is pinned to Python `3.13.14` via `.python-version`.
 
 Core ML stack:
-- `tensorflow`
-- `keras`
+- `scikit-learn` for product classifier training and inference
+- `scikit-learn` with HOG, colour histogram, and coarse spatial features for
+  both product and shelf classifiers
+- Redis/RQ for durable, multi-worker training jobs and progress
 - `mlflow`
 
 ## Run Locally
@@ -511,9 +483,8 @@ Run the API:
 uv run fastapi dev app/main.py
 ```
 
-Train locally from the host machine:
+For a standalone local API and worker, start Redis and then run:
 
 ```bash
-uv run python train/train_classifier/train.py \
-  --mlflow-tracking-uri http://127.0.0.1:5002
+uv run rq worker --url redis://127.0.0.1:6379/0 classifier-training
 ```

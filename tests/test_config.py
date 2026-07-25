@@ -27,6 +27,7 @@ def test_production_accepts_external_s3_and_optional_mlflow() -> None:
         S3_LABEL_STUDIO_EXPORT_BUCKET="exports",
         S3_CREATE_BUCKETS=False,
         MLFLOW_TRACKING_URI=None,
+        TRAINING_QUEUE_URL="redis://queue.example.invalid:6379/0",
     )
 
     assert settings.MLFLOW_TRACKING_URI is None
