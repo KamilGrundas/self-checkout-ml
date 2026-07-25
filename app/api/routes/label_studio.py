@@ -1,28 +1,22 @@
 import httpx
-from fastapi import APIRouter, Header, HTTPException, Query
-from typing_extensions import Annotated
+from fastapi import APIRouter, HTTPException, Query
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import SuperuserDep
-from app.core.label_studio import export_dataset, list_projects, sync_label_studio
-
-router = APIRouter(
-    prefix="/label-studio", tags=["label-studio"], dependencies=[SuperuserDep]
+from app.api.deps import SuperuserToken
+from app.core.label_studio import (
+    export_dataset,
+    get_user_label_studio_api_key,
+    list_projects,
+    sync_label_studio,
 )
 
-LabelStudioApiKey = Annotated[
-    str,
-    Header(
-        alias="X-Label-Studio-Api-Key",
-        min_length=1,
-        description="Label Studio personal access token",
-    ),
-]
+router = APIRouter(prefix="/label-studio", tags=["label-studio"])
 
 
 @router.get("/projects")
-async def get_projects(api_key: LabelStudioApiKey) -> list[dict]:
+async def get_projects(access_token: SuperuserToken) -> list[dict]:
     try:
+        api_key = await run_in_threadpool(get_user_label_studio_api_key, access_token)
         return await run_in_threadpool(list_projects, api_key)
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Label Studio is not reachable")
@@ -31,12 +25,13 @@ async def get_projects(api_key: LabelStudioApiKey) -> list[dict]:
 
 
 @router.post("/sync")
-async def sync(api_key: LabelStudioApiKey) -> dict:
+async def sync(access_token: SuperuserToken) -> dict:
     """Sync S3-compatible object storage images with Label Studio projects.
 
     Returns 503 if Label Studio is unreachable.
     """
     try:
+        api_key = await run_in_threadpool(get_user_label_studio_api_key, access_token)
         result = await run_in_threadpool(sync_label_studio, api_key)
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Label Studio is not reachable")
@@ -47,7 +42,7 @@ async def sync(api_key: LabelStudioApiKey) -> dict:
 
 @router.post("/export")
 async def export(
-    api_key: LabelStudioApiKey,
+    access_token: SuperuserToken,
     project_title: str = Query(..., description="Label Studio project title"),
     release_name: str | None = Query(
         default=None, description="Release name (defaults to timestamp)"
@@ -58,6 +53,7 @@ async def export(
     Returns 503 if Label Studio is unreachable.
     """
     try:
+        api_key = await run_in_threadpool(get_user_label_studio_api_key, access_token)
         result = await run_in_threadpool(
             export_dataset, project_title, api_key, release_name
         )

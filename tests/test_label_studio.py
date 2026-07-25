@@ -1,9 +1,6 @@
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
-
-from app.api.routes.label_studio import router
 from app.core import label_studio
 
 
@@ -54,21 +51,88 @@ def test_blank_request_api_key_is_rejected() -> None:
         label_studio.list_projects("  ")
 
 
-def test_label_studio_routes_require_api_key_header() -> None:
-    app = FastAPI()
-    app.include_router(router)
-    schema = app.openapi()
+def test_user_api_key_is_loaded_from_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BackendResponse:
+        status_code = 200
+        is_success = True
 
-    operations = (
-        schema["paths"]["/label-studio/projects"]["get"],
-        schema["paths"]["/label-studio/sync"]["post"],
-        schema["paths"]["/label-studio/export"]["post"],
+        def json(self) -> dict[str, str]:
+            return {"api_key": "saved-user-token"}
+
+    class BackendClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "BackendClient":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: Any) -> BackendResponse:
+            assert url.endswith("/api/v1/users/me/label-studio/api-key")
+            assert kwargs["headers"] == {"Authorization": "Bearer admin-token"}
+            return BackendResponse()
+
+    monkeypatch.setattr(label_studio.httpx, "Client", BackendClient)
+
+    assert (
+        label_studio.get_user_label_studio_api_key("admin-token") == "saved-user-token"
     )
-    for operation in operations:
-        api_key_parameter = next(
-            parameter
-            for parameter in operation["parameters"]
-            if parameter["name"] == "X-Label-Studio-Api-Key"
-        )
-        assert api_key_parameter["in"] == "header"
-        assert api_key_parameter["required"] is True
+
+
+def test_classify_export_downloads_label_studio_managed_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image_content = b"local-label-studio-image"
+
+    class ImageResponse:
+        content = image_content
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class ImageClient:
+        def __enter__(self) -> "ImageClient":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def get(self, path: str, **kwargs: Any) -> ImageResponse:
+            assert path == "/data/upload/4/product.jpg"
+            assert kwargs == {"follow_redirects": True}
+            return ImageResponse()
+
+    monkeypatch.setattr(
+        label_studio,
+        "_client",
+        lambda headers: ImageClient(),
+    )
+    tasks = [
+        {
+            "data": {"image": "/data/upload/4/product.jpg"},
+            "annotations": [
+                {
+                    "result": [
+                        {
+                            "type": "choices",
+                            "value": {"choices": ["apple"]},
+                        }
+                    ]
+                }
+            ],
+        }
+    ]
+
+    rows = label_studio._parse_classify_tasks(
+        tasks,
+        tmp_path,
+        {"Authorization": "Token saved-user-token"},
+    )
+
+    assert rows == [("product.jpg", "apple")]
+    assert (tmp_path / "product.jpg").read_bytes() == image_content

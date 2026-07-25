@@ -9,6 +9,7 @@ import zipfile
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -17,6 +18,23 @@ from app.core.config import settings
 TIMEOUT = 60.0
 EXPORT_TIMEOUT = 300.0
 logger = logging.getLogger(__name__)
+
+
+def get_user_label_studio_api_key(access_token: str) -> str:
+    url = f"{settings.BACKEND_URL.rstrip('/')}/api/v1/users/me/label-studio/api-key"
+    with httpx.Client(timeout=10.0) as client:
+        response = client.get(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if response.status_code == 404:
+        raise ValueError("Label Studio API key is not configured for this user")
+    if not response.is_success:
+        raise RuntimeError("Could not load Label Studio API key for current user")
+    api_key = response.json().get("api_key", "").strip()
+    if not api_key:
+        raise RuntimeError("Stored Label Studio API key is unavailable")
+    return api_key
 
 
 def _client(headers: dict[str, str]) -> httpx.Client:
@@ -422,23 +440,22 @@ def _download_images_for_labels(
             if stem in label_stems:
                 stem_to_s3[stem] = image_url
 
-    # Download images from S3-compatible object storage
+    # Download images from their original task resources.
     object_storage = get_object_storage()
-    for stem, s3_url in stem_to_s3.items():
-        ext = Path(s3_url).suffix.lower() or ".jpg"
+    for stem, image_url in stem_to_s3.items():
+        ext = Path(image_url).suffix.lower() or ".jpg"
         dest = images_dir / f"{stem}{ext}"
         if dest.exists():
             continue
-        # Parse s3://bucket/key
-        parts = s3_url.replace("s3://", "").split("/", 1)
-        if len(parts) != 2:
-            logger.warning("Invalid S3 URL: %s", s3_url)
-            continue
-        bucket_name, key = parts
         try:
-            object_storage.download_file(bucket_name, key, dest)
+            _download_task_image(
+                headers,
+                image_url,
+                dest,
+                object_storage=object_storage,
+            )
         except Exception as exc:
-            logger.warning("Failed to download %s: %s", s3_url, exc)
+            logger.warning("Failed to download %s: %s", image_url, exc)
 
     logger.info(
         "Downloaded %d/%d images for labels",
@@ -447,7 +464,40 @@ def _download_images_for_labels(
     )
 
 
-def _parse_classify_tasks(tasks: list[dict], images_dir: Path) -> list[tuple[str, str]]:
+def _download_task_image(
+    headers: dict[str, str],
+    image_url: str,
+    dest: Path,
+    *,
+    object_storage: Any | None = None,
+) -> None:
+    """Download an S3 object or a Label Studio-managed upload."""
+    if image_url.startswith("s3://"):
+        from app.core.object_storage import get_object_storage
+
+        bucket_name, separator, key = image_url.removeprefix("s3://").partition("/")
+        if not separator or not bucket_name or not key:
+            raise ValueError(f"Invalid S3 URL: {image_url}")
+        storage = object_storage or get_object_storage()
+        storage.download_file(bucket_name, key, dest)
+        return
+
+    label_studio_url = settings.LABEL_STUDIO_URL.rstrip("/")
+    if image_url.startswith("/") or image_url.startswith(f"{label_studio_url}/"):
+        with _client(headers) as client:
+            response = client.get(image_url, follow_redirects=True)
+            response.raise_for_status()
+            dest.write_bytes(response.content)
+        return
+
+    raise ValueError(f"Unsupported task image URL: {image_url}")
+
+
+def _parse_classify_tasks(
+    tasks: list[dict],
+    images_dir: Path,
+    headers: dict[str, str],
+) -> list[tuple[str, str]]:
     """Extract (filename, label) pairs from Label Studio JSON export of a Choices project.
 
     Downloads each image from S3-compatible object storage into images_dir.
@@ -482,13 +532,13 @@ def _parse_classify_tasks(tasks: list[dict], images_dir: Path) -> list[tuple[str
         dest = images_dir / filename
 
         if not dest.exists():
-            parts = image_url.replace("s3://", "").split("/", 1)
-            if len(parts) != 2:
-                logger.warning("Invalid S3 URL: %s", image_url)
-                continue
-            bucket_name, key = parts
             try:
-                object_storage.download_file(bucket_name, key, dest)
+                _download_task_image(
+                    headers,
+                    image_url,
+                    dest,
+                    object_storage=object_storage,
+                )
             except Exception as exc:
                 logger.warning("Failed to download %s: %s", image_url, exc)
                 continue
@@ -571,7 +621,7 @@ def export_csv_dataset(
         images_dir = extract_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        rows = _parse_classify_tasks(tasks, images_dir)
+        rows = _parse_classify_tasks(tasks, images_dir, headers)
         if not rows:
             raise ValueError("No reviewed classify annotations found in export")
 

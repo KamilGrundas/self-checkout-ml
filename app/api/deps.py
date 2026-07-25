@@ -12,7 +12,7 @@ reusable_oauth2 = OAuth2PasswordBearer(tokenUrl="/api/v1/login/access-token")
 TokenDep = Annotated[str, Depends(reusable_oauth2)]
 
 
-def get_current_superuser(token: TokenDep) -> None:
+def get_current_superuser(token: TokenDep) -> str:
     if not settings.SECRET_KEY:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -30,6 +30,8 @@ def get_current_superuser(token: TokenDep) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not enough privileges",
         )
+    return token
 
 
 SuperuserDep = Depends(get_current_superuser)
+SuperuserToken = Annotated[str, Depends(get_current_superuser)]
