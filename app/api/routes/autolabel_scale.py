@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import Literal
+from uuid import uuid4
+
+import jwt
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, Header, HTTPException, Query, Response, status
+from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+
+from app.api.deps import SuperuserToken
+from app.core.autolabel import (
+    MAX_BATCH_IMAGES,
+    MAX_OBJECT_NAME_LENGTH,
+    AutolabelSidecar,
+    build_prompt,
+    call_inference,
+    decode_cursor,
+    encode_cursor,
+    is_supported_image,
+    load_catalog,
+    load_configuration,
+    manual_label,
+    read_sidecar,
+    require_source_image,
+    source_fingerprint,
+)
+from app.core.autolabel_queue import (
+    IDEMPOTENCY_TTL_SECONDS,
+    JOB_RETENTION_SECONDS,
+    JOB_TIMEOUT,
+    get_autolabel_queue,
+    get_redis,
+    initial_job_meta,
+    request_digest,
+)
+from app.core.autolabel_worker import run_autolabel_batch
+from app.core.config import settings
+from app.core.object_storage import get_object_storage
+
+router = APIRouter(
+    prefix="/autolabel/scale",
+    tags=["scale-autolabel"],
+)
+
+ItemStatus = Literal[
+    "unlabeled",
+    "queued",
+    "processing",
+    "matched",
+    "unmatched",
+    "failed",
+]
+
+
+class AutolabelResultPublic(BaseModel):
+    state: Literal["matched", "unmatched", "failed"]
+    product_id: str | None
+    product_name: str | None
+    timestamp: datetime
+    batch_id: str
+    error: str | None = None
+
+
+class ScaleImagePublic(BaseModel):
+    object_name: str
+    image_url: str
+    size: int
+    etag: str | None
+    session_id: str | None
+    capture_index: int | None
+    is_empty: bool
+    existing_product_id: str | None
+    existing_product_name: str | None
+    autolabel: AutolabelResultPublic | None
+    status: ItemStatus
+
+
+class ScaleImagesPage(BaseModel):
+    data: list[ScaleImagePublic]
+    next_cursor: str | None
+
+
+class AutolabelBatchRequest(BaseModel):
+    object_names: list[str] = Field(min_length=1, max_length=MAX_BATCH_IMAGES)
+    confirm_existing_labels: bool = False
+    retry_only: bool = False
+
+
+class AutolabelBatchItem(BaseModel):
+    object_name: str
+    status: ItemStatus
+    product_id: str | None = None
+    product_name: str | None = None
+    error: str | None = None
+
+
+class AutolabelBatchPublic(BaseModel):
+    batch_id: str
+    status: Literal["queued", "processing", "completed", "failed"]
+    total: int
+    completed: int
+    matched: int
+    unmatched: int
+    failed: int
+    items: list[AutolabelBatchItem]
+
+
+class AutolabelTestRequest(BaseModel):
+    object_name: str = Field(min_length=1, max_length=MAX_OBJECT_NAME_LENGTH)
+
+
+class AutolabelTestResult(BaseModel):
+    state: Literal["matched", "unmatched"]
+    candidate_key: str | None
+    product_id: str | None
+    product_name: str | None
+    response_sha256: str
+
+
+def _subject(access_token: str) -> str:
+    try:
+        payload = jwt.decode(
+            access_token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"],
+        )
+        subject = str(payload["sub"])
+    except (jwt.InvalidTokenError, KeyError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+    return subject
+
+
+def _redis_text(value: bytes | str | None) -> str | None:
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
+def _serialize_job(job: Job) -> AutolabelBatchPublic:
+    rq_status = job.get_status(refresh=True)
+    meta = job.meta or {}
+    if rq_status in {"failed", "stopped", "canceled"}:
+        public_status = "failed"
+    else:
+        public_status = str(meta.get("status") or "queued")
+    if public_status not in {"queued", "processing", "completed", "failed"}:
+        public_status = "queued"
+    items = [
+        AutolabelBatchItem.model_validate(item) for item in (meta.get("items") or [])
+    ]
+    if public_status == "failed":
+        for item in items:
+            if item.status in {"queued", "processing"}:
+                item.status = "failed"
+                item.error = "Autolabel worker stopped before completing the item"
+    return AutolabelBatchPublic(
+        batch_id=job.id,
+        status=public_status,  # type: ignore[arg-type]
+        total=int(meta.get("total") or len(items)),
+        completed=int(meta.get("completed") or 0),
+        matched=int(meta.get("matched") or 0),
+        unmatched=int(meta.get("unmatched") or 0),
+        failed=int(meta.get("failed") or 0),
+        items=items,
+    )
+
+
+def _latest_batch(access_token: str) -> AutolabelBatchPublic | None:
+    try:
+        job_id = _redis_text(
+            get_redis().get(f"autolabel:latest:{_subject(access_token)}")
+        )
+        if not job_id:
+            return None
+        job = Job.fetch(job_id, connection=get_autolabel_queue().connection)
+        return _serialize_job(job)
+    except (NoSuchJobError, RedisError):
+        return None
+
+
+def _active_items(access_token: str) -> dict[str, AutolabelBatchItem]:
+    batch = _latest_batch(access_token)
+    if not batch or batch.status not in {"queued", "processing"}:
+        return {}
+    return {item.object_name: item for item in batch.items}
+
+
+def _parse_session_fields(object_name: str) -> tuple[str | None, int | None]:
+    matched = re.fullmatch(
+        r"sessions/([^/]+)/captures/(\d+)-(?:empty|product)(?:\.[^/]+)?",
+        object_name,
+    )
+    if not matched:
+        return None, None
+    return matched.group(1), int(matched.group(2))
+
+
+def _result_public(sidecar: AutolabelSidecar | None) -> AutolabelResultPublic | None:
+    if sidecar is None:
+        return None
+    return AutolabelResultPublic(
+        state=sidecar.state,
+        product_id=sidecar.product_id,
+        product_name=sidecar.product_name,
+        timestamp=sidecar.timestamp,
+        batch_id=sidecar.batch_id,
+        error=sidecar.error,
+    )
+
+
+@router.get("/images", response_model=ScaleImagesPage)
+def list_scale_images(
+    access_token: SuperuserToken,
+    cursor: str | None = None,
+    page_size: int = Query(default=24, ge=1, le=50),
+) -> ScaleImagesPage:
+    if not settings.S3_SCALE_BUCKET:
+        raise HTTPException(
+            status_code=503, detail="Scale image bucket is not configured"
+        )
+    try:
+        continuation = decode_cursor(cursor) if cursor else None
+        objects, next_token = get_object_storage().list_objects_page(
+            settings.S3_SCALE_BUCKET,
+            max_keys=page_size,
+            continuation_token=continuation,
+        )
+    except (ValueError, ClientError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid image cursor") from exc
+
+    active_items = _active_items(access_token)
+    images: list[ScaleImagePublic] = []
+    for item in objects:
+        metadata = get_object_storage().head_object(
+            settings.S3_SCALE_BUCKET, item.object_name
+        )
+        if not is_supported_image(item.object_name, metadata.content_type):
+            continue
+        fingerprint = source_fingerprint(metadata)
+        sidecar = read_sidecar(item.object_name, fingerprint)
+        existing_product_id, existing_product_name = manual_label(metadata)
+        session_id, capture_index = _parse_session_fields(item.object_name)
+        active = active_items.get(item.object_name)
+        item_status: ItemStatus
+        if active:
+            item_status = active.status
+        elif sidecar:
+            item_status = sidecar.state
+        else:
+            item_status = "unlabeled"
+        images.append(
+            ScaleImagePublic(
+                object_name=item.object_name,
+                image_url="autolabel/scale/images/content",
+                size=metadata.size,
+                etag=metadata.etag,
+                session_id=session_id,
+                capture_index=capture_index,
+                is_empty=capture_index == 0
+                or "0000-empty" in item.object_name.rsplit("/", 1)[-1],
+                existing_product_id=existing_product_id,
+                existing_product_name=existing_product_name,
+                autolabel=_result_public(sidecar),
+                status=item_status,
+            )
+        )
+    return ScaleImagesPage(
+        data=images,
+        next_cursor=encode_cursor(next_token) if next_token else None,
+    )
+
+
+@router.get("/images/content")
+def get_scale_image_content(
+    access_token: SuperuserToken,
+    object_name: str = Query(min_length=1, max_length=MAX_OBJECT_NAME_LENGTH),
+) -> Response:
+    del access_token
+    try:
+        metadata = require_source_image(object_name)
+        image_bytes = get_object_storage().get_bytes(
+            settings.S3_SCALE_BUCKET,
+            object_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not load scale image"
+        ) from exc
+    return Response(
+        content=image_bytes,
+        media_type=metadata.content_type or "application/octet-stream",
+        headers={
+            "Cache-Control": "private, max-age=60",
+            **({"ETag": metadata.etag} if metadata.etag else {}),
+        },
+    )
+
+
+@router.post(
+    "/batches",
+    response_model=AutolabelBatchPublic,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_batch(
+    body: AutolabelBatchRequest,
+    access_token: SuperuserToken,
+    idempotency_key: str = Header(
+        min_length=8,
+        max_length=128,
+        alias="Idempotency-Key",
+    ),
+) -> AutolabelBatchPublic:
+    object_names = list(dict.fromkeys(body.object_names))
+    if len(object_names) != len(body.object_names):
+        body = body.model_copy(update={"object_names": object_names})
+    try:
+        configuration = load_configuration(access_token)
+        catalog = load_catalog(access_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    for object_name in object_names:
+        try:
+            metadata = require_source_image(object_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing_product_id, existing_product_name = manual_label(metadata)
+        sidecar = read_sidecar(object_name, source_fingerprint(metadata))
+        if (
+            existing_product_id or existing_product_name
+        ) and not body.confirm_existing_labels:
+            raise HTTPException(
+                status_code=409,
+                detail="Existing image labels require explicit confirmation",
+            )
+        if body.retry_only and (sidecar is None or sidecar.state == "matched"):
+            raise HTTPException(
+                status_code=409,
+                detail="Retry accepts only failed or unmatched images",
+            )
+
+    subject = _subject(access_token)
+    digest = request_digest(object_names)
+    batch_id = str(uuid4())
+    redis = get_redis()
+    idempotency_redis_key = f"autolabel:idempotency:{subject}:{idempotency_key}"
+    reservation = json.dumps({"digest": digest, "batch_id": batch_id})
+    try:
+        reserved = redis.set(
+            idempotency_redis_key,
+            reservation,
+            ex=IDEMPOTENCY_TTL_SECONDS,
+            nx=True,
+        )
+        if not reserved:
+            existing_raw = _redis_text(redis.get(idempotency_redis_key))
+            existing = json.loads(existing_raw or "{}")
+            if existing.get("digest") != digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used for another request",
+                )
+            job = Job.fetch(
+                str(existing["batch_id"]),
+                connection=get_autolabel_queue().connection,
+            )
+            return _serialize_job(job)
+
+        job = get_autolabel_queue().enqueue(
+            run_autolabel_batch,
+            {
+                "batch_id": batch_id,
+                "object_names": object_names,
+                "configuration": configuration.model_dump(mode="json"),
+                "catalog": [item.model_dump(mode="json") for item in catalog],
+            },
+            job_id=batch_id,
+            job_timeout=JOB_TIMEOUT,
+            result_ttl=JOB_RETENTION_SECONDS,
+            failure_ttl=JOB_RETENTION_SECONDS,
+            meta=initial_job_meta(object_names),
+            description=f"Autolabel {len(object_names)} scale images",
+        )
+        redis.set(
+            f"autolabel:latest:{subject}",
+            batch_id,
+            ex=JOB_RETENTION_SECONDS,
+        )
+        return _serialize_job(job)
+    except HTTPException:
+        raise
+    except (RedisError, NoSuchJobError, KeyError, ValueError) as exc:
+        redis.delete(idempotency_redis_key)
+        raise HTTPException(
+            status_code=503,
+            detail="Autolabel queue is unavailable",
+        ) from exc
+
+
+@router.get("/batches/latest", response_model=AutolabelBatchPublic)
+def latest_batch(access_token: SuperuserToken) -> AutolabelBatchPublic:
+    batch = _latest_batch(access_token)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="No recent autolabel batch")
+    return batch
+
+
+@router.get("/batches/{batch_id}", response_model=AutolabelBatchPublic)
+def batch_status(
+    batch_id: str,
+    access_token: SuperuserToken,
+) -> AutolabelBatchPublic:
+    latest = _latest_batch(access_token)
+    if latest is None or latest.batch_id != batch_id:
+        raise HTTPException(status_code=404, detail="Autolabel batch not found")
+    return latest
+
+
+@router.post("/test", response_model=AutolabelTestResult)
+def test_endpoint(
+    body: AutolabelTestRequest,
+    access_token: SuperuserToken,
+) -> AutolabelTestResult:
+    if not settings.S3_SCALE_BUCKET:
+        raise HTTPException(
+            status_code=503, detail="Scale image bucket is not configured"
+        )
+    try:
+        configuration = load_configuration(access_token)
+        catalog = load_catalog(access_token)
+        metadata = require_source_image(body.object_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    image_bytes = get_object_storage().get_bytes(
+        settings.S3_SCALE_BUCKET, body.object_name
+    )
+    try:
+        result = call_inference(
+            configuration=configuration,
+            object_name=body.object_name,
+            content_type=metadata.content_type or "application/octet-stream",
+            image_bytes=image_bytes,
+            prompt=build_prompt(catalog),
+            allowed_keys={item.key for item in catalog},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    selected = next(
+        (item for item in catalog if item.key == result.candidate_key), None
+    )
+    return AutolabelTestResult(
+        state=result.state,
+        candidate_key=result.candidate_key,
+        product_id=selected.product_id if selected else None,
+        product_name=selected.name if selected else None,
+        response_sha256=result.response_sha256,
+    )

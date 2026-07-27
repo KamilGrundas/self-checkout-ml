@@ -3,6 +3,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from datetime import datetime
 from typing import Iterator
 from urllib.parse import quote
 
@@ -19,12 +20,16 @@ class S3Object:
     object_name: str
     size: int
     content_type: str | None = None
+    etag: str | None = None
+    last_modified: datetime | None = None
 
 
 @dataclass(frozen=True)
 class S3ObjectMetadata:
     content_type: str | None
     metadata: dict[str, str]
+    size: int = 0
+    etag: str | None = None
 
 
 class S3ObjectStorage:
@@ -63,7 +68,36 @@ class S3ObjectStorage:
                 yield S3Object(
                     object_name=item["Key"],
                     size=item.get("Size", 0),
+                    etag=str(item.get("ETag") or "").strip('"') or None,
+                    last_modified=item.get("LastModified"),
                 )
+
+    def list_objects_page(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        max_keys: int = 50,
+        continuation_token: str | None = None,
+    ) -> tuple[list[S3Object], str | None]:
+        request: dict[str, object] = {
+            "Bucket": bucket,
+            "Prefix": prefix,
+            "MaxKeys": max_keys,
+        }
+        if continuation_token:
+            request["ContinuationToken"] = continuation_token
+        page = self.client.list_objects_v2(**request)
+        objects = [
+            S3Object(
+                object_name=item["Key"],
+                size=item.get("Size", 0),
+                etag=str(item.get("ETag") or "").strip('"') or None,
+                last_modified=item.get("LastModified"),
+            )
+            for item in page.get("Contents", [])
+        ]
+        return objects, page.get("NextContinuationToken")
 
     def put_bytes(
         self,
@@ -113,6 +147,21 @@ class S3ObjectStorage:
         return S3ObjectMetadata(
             content_type=response.get("ContentType"),
             metadata=response.get("Metadata", {}),
+            size=int(response.get("ContentLength") or 0),
+            etag=str(response.get("ETag") or "").strip('"') or None,
+        )
+
+    def presigned_get_url(
+        self,
+        bucket: str,
+        object_name: str,
+        *,
+        expires_seconds: int = 300,
+    ) -> str:
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": object_name},
+            ExpiresIn=expires_seconds,
         )
 
     def delete_objects(self, bucket: str, object_names: list[str]) -> None:

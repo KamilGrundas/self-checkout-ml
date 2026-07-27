@@ -1787,6 +1787,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "fastapi", extra = ["standard"] },
+    { name = "httpx" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
     { name = "pydantic" },
@@ -1809,6 +1810,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.35.0,<2.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.114.2,<1.0.0" },
+    { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
     { name = "mlflow", specifier = ">=3.1,<4.0" },
     { name = "opencv-python-headless", specifier = ">=4.10.0,<5.0.0" },
     { name = "pydantic", specifier = ">2.0" },
