@@ -9,6 +9,8 @@ The current repository covers:
 - S3-compatible object storage storage for raw shelf, scale, upload, and training-release data
 - local extraction and review pipeline
 - durable Redis/RQ product-classifier training with MLflow logging
+- durable, sequential Redis/RQ scale-image autolabeling through a configurable
+  local VLM
 - Label Studio export-to-bucket dataset build script
 
 ## Repository Layout
@@ -21,6 +23,10 @@ The current repository covers:
 - `app/core/training.py` - scikit-learn classifier training pipeline
 - `app/core/training_queue.py` - durable Redis/RQ queue integration
 - `app/core/training_worker.py` - worker entry point and persisted progress updates
+- `app/core/autolabel.py` - prompt, strict response parser, inference client,
+  catalog snapshot, and durable result sidecars
+- `app/core/autolabel_queue.py` - idempotency and dedicated RQ queue integration
+- `app/core/autolabel_worker.py` - per-image fault isolation and batch progress
 
 ## Raw Snapshot Storage
 
@@ -70,6 +76,43 @@ Additional raw buckets:
 
 `GET /api/v1/checkout-sessions/{session_id}/scale-snapshots`
 - returns ordered scale snapshots for the session
+
+### Scale autolabeling
+
+All endpoints below require a backend-issued superuser JWT:
+
+- `GET /api/v1/autolabel/scale/images` — cursor-paginated image list from
+  `S3_SCALE_BUCKET`, excluding non-images and the reserved sidecar prefix
+- `GET /api/v1/autolabel/scale/images/content` — authenticated image delivery
+  used by admin thumbnails; browsers never receive Compose-only S3 URLs
+- `POST /api/v1/autolabel/scale/test` — invokes the configured VLM for one
+  image without persisting a label
+- `POST /api/v1/autolabel/scale/batches` — returns HTTP 202 and requires an
+  `Idempotency-Key`
+- `GET /api/v1/autolabel/scale/batches/latest` — restores the latest retained
+  batch for the current superuser
+- `GET /api/v1/autolabel/scale/batches/{batch_id}` — batch and per-image status
+
+Before enqueueing, ML loads the complete paginated product catalog and the
+global endpoint configuration from the backend. A batch stores snapshots of
+both. Candidates use deterministic keys (`P0001`, `P0002`, ...); only a key
+present in that snapshot can map to a backend product UUID.
+
+The VLM request is bounded multipart form-data with `prompt`, `max_tokens`, and
+the original image bytes. Redirects are disabled, connect/read timeouts are
+explicit, and the response is size-limited. The parser accepts the directly
+observed endpoint envelope, whose `response` field contains either plain JSON
+or one fenced JSON object. Descriptive output, extra fields, invalid JSON, and
+unknown keys never produce a product assignment.
+
+`scale-autolabel` is consumed by a dedicated concurrency-1 RQ worker so it
+cannot block classifier training. Queue state may expire, but final
+`matched`/`unmatched` results are stored as schema-versioned JSON sidecars below
+`_autolabel/scale/v1/`, keyed by a hash of the complete source object name.
+Sidecars contain the source fingerprint, endpoint/prompt snapshot, safe
+response diagnostics, result, and batch identifier. A source ETag/size change
+invalidates the old result. Source images and their manual metadata are never
+overwritten.
 
 `POST /api/v1/datasets/shelf-images`
 - multipart form-data
@@ -149,6 +192,17 @@ Runtime behavior:
 - `detect` uses the shelf classifier cached in memory
 - if the process restarts, both models load from local disk cache when available
 - MLflow is only required for training and refresh endpoints, not for every inference request
+
+## Verification
+
+```bash
+uv run --group dev ruff check app tests
+uv run --group dev ruff format app tests --check
+uv run --group dev pytest
+```
+
+Docker, object-storage integration, and full-stack validation run through the
+workspace-controlled `../ops/dev-test.sh --repo ml` command on `ssh dev`.
 
 ## Local Data Layout
 
