@@ -22,11 +22,11 @@ async def classify_image(file: UploadFile = File(...)) -> PredictionPublic:
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image file")
 
-    scores, run_id = await run_in_threadpool(
+    scores, model_id = await run_in_threadpool(
         classifier_model_store.predict,
         image_bytes,
     )
-    return PredictionPublic(scores=scores, run_id=run_id)
+    return PredictionPublic(scores=scores, model_id=model_id)
 
 
 @router.post("/detect", response_model=PredictionPublic, dependencies=[SuperuserDep])
@@ -38,11 +38,11 @@ async def detect_image(file: UploadFile = File(...)) -> PredictionPublic:
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image file")
 
-    scores, run_id = await run_in_threadpool(
+    scores, model_id = await run_in_threadpool(
         shelf_model_store.predict,
         image_bytes,
     )
-    return PredictionPublic(scores=scores, run_id=run_id)
+    return PredictionPublic(scores=scores, model_id=model_id)
 
 
 @router.get(

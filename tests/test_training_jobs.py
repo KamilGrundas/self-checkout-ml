@@ -96,7 +96,6 @@ def test_classifier_rejects_empty_dataset_selection() -> None:
 def test_training_worker_persists_progress_and_result(monkeypatch) -> None:
     job = FakeJob(meta={"total_epochs": 3})
     monkeypatch.setattr(training_worker, "get_current_job", lambda: job)
-    monkeypatch.setattr(training_worker, "check_mlflow", lambda: None)
 
     def fake_train_classifier(*args, progress_callback, **kwargs):
         progress_callback(
@@ -109,33 +108,33 @@ def test_training_worker_persists_progress_and_result(monkeypatch) -> None:
                 "metrics": {"accuracy": 0.75},
             }
         )
-        return {"run_id": "run-1"}
+        return {"model_id": "model-1"}
 
     monkeypatch.setattr(training_worker, "train_classifier", fake_train_classifier)
 
     result = training_worker.run_training_job(valid_body())
 
-    assert result == {"run_id": "run-1"}
+    assert result == {"model_id": "model-1"}
     assert job.meta["stage"] == "completed"
     assert job.meta["current_epoch"] == 3
     assert job.meta["metrics"] == {"accuracy": 0.75}
-    assert job.saved_meta == 3
+    assert job.saved_meta == 2
 
 
 def test_training_worker_persists_failure(monkeypatch) -> None:
     job = FakeJob()
     monkeypatch.setattr(training_worker, "get_current_job", lambda: job)
 
-    def fail_mlflow_check() -> None:
-        raise RuntimeError("MLflow unavailable")
+    def fail_training(*args, **kwargs):
+        raise RuntimeError("Object storage unavailable")
 
-    monkeypatch.setattr(training_worker, "check_mlflow", fail_mlflow_check)
+    monkeypatch.setattr(training_worker, "train_classifier", fail_training)
 
-    with pytest.raises(RuntimeError, match="MLflow unavailable"):
+    with pytest.raises(RuntimeError, match="Object storage unavailable"):
         training_worker.run_training_job(valid_body())
 
     assert job.meta["stage"] == "failed"
-    assert job.meta["error"] == "MLflow unavailable"
+    assert job.meta["error"] == "Object storage unavailable"
 
 
 def test_completed_queue_job_is_serialized() -> None:
@@ -147,13 +146,13 @@ def test_completed_queue_job_is_serialized() -> None:
             "progress": 100,
             "total_epochs": 3,
         },
-        result={"run_id": "run-1"},
+        result={"model_id": "model-1"},
     )
 
     response = train._serialize_job(job)  # type: ignore[arg-type]
 
     assert response.status == "completed"
-    assert response.result == {"run_id": "run-1"}
+    assert response.result == {"model_id": "model-1"}
 
 
 def test_classifier_trains_on_image_features_and_reports_each_epoch(tmp_path) -> None:
@@ -186,14 +185,9 @@ def test_classifier_trains_on_image_features_and_reports_each_epoch(tmp_path) ->
     assert model.predict_proba(x_val.reshape(2, -1)).shape == (2, 2)
     assert 0 <= metrics["val_accuracy"] <= 1
 
-    import mlflow.sklearn
+    import joblib
 
-    model_path = tmp_path / "model"
-    mlflow.sklearn.save_model(
-        model,
-        path=model_path,
-        input_example=x_val[:1].reshape(1, -1),
-        skops_trusted_types=training.SKOPS_TRUSTED_TYPES,
-    )
-    restored = mlflow.sklearn.load_model(str(model_path))
+    model_path = tmp_path / "model.joblib"
+    joblib.dump(model, model_path)
+    restored = joblib.load(model_path)
     assert restored.predict_proba(x_val.reshape(2, -1)).shape == (2, 2)

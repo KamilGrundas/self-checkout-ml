@@ -51,19 +51,8 @@ class Settings(BaseSettings):
     S3_SCALE_BUCKET: str | None = None
     S3_EXTERNAL_BUCKET: str | None = None
     S3_TRAINING_BUCKET: str | None = None
-    S3_LABEL_STUDIO_EXPORT_BUCKET: str | None = None
-    MLFLOW_TRACKING_URI: str | None = None
-    MLFLOW_EXPERIMENT_NAME: str = "self-checkout-classifier"
-    MLFLOW_REGISTERED_MODEL_NAME: str = "self-checkout-classifier"
-    MLFLOW_SHELF_EXPERIMENT_NAME: str = "self-checkout-shelf-classifier"
-    MLFLOW_SHELF_MODEL_NAME: str = "self-checkout-shelf-classifier"
-    MODEL_CACHE_DIR: str = ".cache/model_store"
     TRAINING_QUEUE_URL: str | None = None
     BACKEND_URL: str = "http://127.0.0.1:8000"
-    LABEL_STUDIO_URL: str = "http://127.0.0.1:8080"
-    LABEL_STUDIO_SCALE_PROJECT_TITLE: str = "scale-products"
-    LABEL_STUDIO_SHELF_PROJECT_TITLE: str = "shelf-products"
-    LABEL_STUDIO_EXTERNAL_PROJECT_TITLE: str = "external-products"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -80,7 +69,6 @@ class Settings(BaseSettings):
             "S3_SCALE_BUCKET": "scale-images",
             "S3_EXTERNAL_BUCKET": "uploaded-images",
             "S3_TRAINING_BUCKET": "training-data",
-            "S3_LABEL_STUDIO_EXPORT_BUCKET": "labelstudio-exports",
         }
         if self.S3_ENDPOINT_URL is None:
             if not is_local:
@@ -105,8 +93,6 @@ class Settings(BaseSettings):
             raise ValueError("S3_USE_SSL must be true for an https S3_ENDPOINT_URL")
         if self.S3_ENDPOINT_URL.scheme == "http" and self.S3_USE_SSL:
             raise ValueError("S3_USE_SSL must be false for an http S3_ENDPOINT_URL")
-        if self.MLFLOW_TRACKING_URI is None and is_local:
-            self.MLFLOW_TRACKING_URI = "http://127.0.0.1:5002"
         if self.TRAINING_QUEUE_URL is None:
             if not is_local:
                 raise ValueError(

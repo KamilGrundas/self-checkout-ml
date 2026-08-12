@@ -11,7 +11,7 @@ from app.core.config import settings
 
 QUEUE_NAME = "scale-autolabel"
 JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
-JOB_TIMEOUT = "12h"
+JOB_TIMEOUT = "30d"
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
 
@@ -35,7 +35,9 @@ def request_digest(object_names: list[str]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def initial_job_meta(object_names: list[str]) -> dict[str, Any]:
+def initial_job_meta(
+    object_names: list[str], *, include_items: bool = True
+) -> dict[str, Any]:
     return {
         "status": "queued",
         "total": len(object_names),
@@ -52,5 +54,7 @@ def initial_job_meta(object_names: list[str]) -> dict[str, Any]:
                 "error": None,
             }
             for object_name in object_names
-        ],
+        ]
+        if include_items
+        else [],
     }

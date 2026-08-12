@@ -14,6 +14,7 @@ from app.core.autolabel import (
     InferenceParseError,
     InferenceRequestError,
 )
+from app.core.object_storage import S3Object, S3ObjectMetadata
 
 ORIGINAL_HTTPX_CLIENT = httpx.Client
 
@@ -371,3 +372,79 @@ def test_worker_continues_after_single_image_failure(
     assert result["failed"] == 1
     assert result["unmatched"] == 1
     assert job.saved >= 5
+
+    bulk_job = FakeJob()
+    bulk_job.meta.update(
+        items=[], total=2, completed=0, matched=0, unmatched=0, failed=0
+    )
+    processed.clear()
+    monkeypatch.setattr(autolabel_worker, "get_current_job", lambda: bulk_job)
+
+    bulk_result = autolabel_worker.run_autolabel_batch(
+        {
+            "batch_id": "bulk-batch",
+            "object_names": ["one.jpg", "two.jpg"],
+            "configuration": configuration().model_dump(),
+            "catalog": [item.model_dump() for item in catalog()],
+        }
+    )
+
+    assert bulk_result["items"] == []
+    assert bulk_result["completed"] == 2
+    assert bulk_result["failed"] == 1
+    assert bulk_result["unmatched"] == 1
+
+
+def test_finalize_worker_moves_only_matched_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FinalizeStorage:
+        def __init__(self) -> None:
+            self.copied: list[str] = []
+            self.deleted: list[str] = []
+
+        def list_objects(self, bucket: str):
+            yield S3Object("raw/scale/matched.jpg", 10, etag="matched")
+            yield S3Object("raw/scale/unmatched.jpg", 10, etag="unmatched")
+            yield S3Object("_autolabel/scale/v1/result.json", 10)
+
+        def head_object(self, bucket: str, object_name: str):
+            return S3ObjectMetadata("image/jpeg", {}, 10, object_name)
+
+        def copy_object(self, **kwargs) -> None:
+            self.copied.append(kwargs["source_object"])
+
+        def delete_objects(self, bucket: str, object_names: list[str]) -> None:
+            self.deleted.extend(object_names)
+
+    storage = FinalizeStorage()
+    matched = AutolabelSidecar(
+        bucket="scale",
+        object_name="raw/scale/matched.jpg",
+        source_size=10,
+        source_fingerprint="raw/scale/matched.jpg",
+        product_id="product-id",
+        product_name="Jabłko",
+        state="matched",
+        timestamp="2026-08-12T10:00:00Z",
+        batch_id="batch",
+        endpoint_url="manual",
+        max_tokens=1,
+    )
+    monkeypatch.setattr(autolabel_worker, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(autolabel_worker.settings, "S3_SCALE_BUCKET", "scale")
+    monkeypatch.setattr(autolabel_worker.settings, "S3_EXTERNAL_BUCKET", "external")
+    monkeypatch.setattr(
+        autolabel_worker,
+        "read_sidecar",
+        lambda object_name, fingerprint: (
+            matched if object_name == "raw/scale/matched.jpg" else None
+        ),
+    )
+    monkeypatch.setattr(autolabel_worker, "get_current_job", lambda: None)
+
+    result = autolabel_worker.run_finalize_all_matched()
+
+    assert result == {"moved": 1}
+    assert storage.copied == ["raw/scale/matched.jpg"]
+    assert "raw/scale/matched.jpg" in storage.deleted

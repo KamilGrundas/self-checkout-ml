@@ -6,7 +6,7 @@ from typing import Any
 
 from rq import get_current_job
 
-from app.core.training import check_mlflow, train_classifier
+from app.core.training import train_classifier
 
 
 def _update_job(**updates: object) -> None:
@@ -20,12 +20,6 @@ def _update_job(**updates: object) -> None:
 def run_training_job(body: dict[str, Any]) -> dict[str, Any]:
     """Train and register a model while persisting progress in the RQ job."""
     try:
-        _update_job(
-            stage="checking_mlflow",
-            message="Checking MLflow availability",
-            progress=2.0,
-        )
-        check_mlflow()
 
         def update_progress(update: dict[str, object]) -> None:
             _update_job(**update)

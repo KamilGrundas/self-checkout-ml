@@ -14,7 +14,6 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 TrainingProgressCallback = Callable[[dict[str, object]], None]
-SKOPS_TRUSTED_TYPES = ["app.core.image_features.ProductImageFeatures"]
 
 
 def _download_datasets(prefixes: list[str], dest: Path) -> None:
@@ -261,24 +260,6 @@ def _split_data(images: list, labels: list, val_ratio: float) -> tuple:
     )
 
 
-def check_mlflow() -> None:
-    """Raise RuntimeError if MLflow is not reachable."""
-    import urllib.error
-    import urllib.request
-
-    if not settings.MLFLOW_TRACKING_URI:
-        raise RuntimeError(
-            "MLflow is disabled because MLFLOW_TRACKING_URI is not configured"
-        )
-    url = f"{settings.MLFLOW_TRACKING_URI.rstrip('/')}/health"
-    try:
-        urllib.request.urlopen(url, timeout=5)
-    except (urllib.error.URLError, OSError) as exc:
-        raise RuntimeError(
-            f"MLflow is not reachable at {settings.MLFLOW_TRACKING_URI}"
-        ) from exc
-
-
 def _fit_classifier(
     x_train: Any,
     y_train: Any,
@@ -383,17 +364,7 @@ def train_classifier(
     validation_ratio: float = 0.2,
     progress_callback: TrainingProgressCallback | None = None,
 ) -> dict:
-    """Train a classifier from YOLO datasets (crops) and/or CSV datasets (whole images)
-    stored in S3-compatible object storage and register the result in MLflow.
-    """
-    import os
-
-    import mlflow
-    import mlflow.sklearn
-    from mlflow.models import infer_signature
-
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "120")
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
+    """Train and store a classifier in generic S3-compatible object storage."""
 
     def report(
         stage: str,
@@ -414,10 +385,6 @@ def train_classifier(
                     "metrics": metrics,
                 }
             )
-
-    check_mlflow()
-
-    model_name = settings.MLFLOW_REGISTERED_MODEL_NAME
 
     with tempfile.TemporaryDirectory() as tmp:
         groups = []
@@ -453,8 +420,6 @@ def train_classifier(
 
     x_train, y_train, x_val, y_val = _split_data(images, labels, validation_ratio)
     has_val = len(x_val) > 0
-    x_train_flat = x_train.reshape(len(x_train), -1)
-
     report("training", f"Starting epoch 1 of {epochs}", 25, current_epoch=0)
 
     def report_epoch(current_epoch: int, metrics: dict[str, float]) -> None:
@@ -486,55 +451,34 @@ def train_classifier(
         "epochs_ran": epochs,
         "yolo_datasets": yolo_datasets,
         "csv_datasets": csv_datasets or [],
+        "accuracy": last_metrics["accuracy"],
+        "loss": last_metrics["loss"],
     }
     if has_val:
         report("evaluating", "Evaluating the trained model", 88)
         result["val_loss"] = last_metrics["val_loss"]
         result["val_accuracy"] = last_metrics["val_accuracy"]
 
-    report("registering", "Saving the model in MLflow", 92)
-    mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
+    report("saving", "Saving the trained model", 92)
+    from app.core.inference import classifier_model_store
 
-    with mlflow.start_run() as run:
-        mlflow.set_tags(
-            {
-                "pipeline": "train_classifier",
-                "framework": "scikit-learn",
-                "datasets": ",".join(yolo_datasets),
-            }
-        )
-        mlflow.log_params(
-            {
-                "image_size": image_size,
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "validation_ratio": validation_ratio,
-                "num_classes": len(class_names),
-            }
-        )
-        mlflow.log_metrics(
-            {k: v for k, v in result.items() if isinstance(v, (int, float))}
-        )
-
-        input_example = x_train_flat[:1]
-        signature = infer_signature(
-            input_example,
-            model.predict_proba(input_example),
-        )
-        mlflow.sklearn.log_model(
-            model,
-            name=model_name,
-            registered_model_name=model_name,
-            skops_trusted_types=SKOPS_TRUSTED_TYPES,
-            signature=signature,
-            metadata={
-                "labels": class_names,
-                "image_size": image_size,
-                "num_classes": len(class_names),
-            },
-        )
-        result["run_id"] = run.info.run_id
-        result["model_name"] = model_name
+    registered = classifier_model_store.register(
+        model=model,
+        labels=class_names,
+        image_size=image_size,
+        metrics={name: float(value) for name, value in last_metrics.items()},
+        parameters={
+            "image_size": image_size,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "validation_ratio": validation_ratio,
+            "num_classes": len(class_names),
+            "yolo_datasets": yolo_datasets,
+            "csv_datasets": csv_datasets or [],
+        },
+    )
+    result["model_id"] = registered["model_id"]
+    result["model_name"] = registered["name"]
+    result["model_version"] = registered["version"]
 
     return result

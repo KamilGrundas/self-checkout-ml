@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
@@ -29,6 +29,7 @@ from app.core.autolabel import (
     manual_label,
     read_sidecar,
     require_source_image,
+    sidecar_object_name,
     source_fingerprint,
 )
 from app.core.autolabel_queue import (
@@ -40,8 +41,13 @@ from app.core.autolabel_queue import (
     initial_job_meta,
     request_digest,
 )
-from app.core.autolabel_worker import run_autolabel_batch
+from app.core.autolabel_worker import run_autolabel_batch, run_finalize_all_matched
 from app.core.config import settings
+from app.core.labeled_images import (
+    MAX_SELECTED_IMAGES,
+    label_metadata,
+    labeled_object_name,
+)
 from app.core.object_storage import get_object_storage
 
 router = APIRouter(
@@ -75,7 +81,9 @@ class ScaleImagePublic(BaseModel):
     etag: str | None
     session_id: str | None
     capture_index: int | None
+    captured_at: datetime | None
     is_empty: bool
+    is_imported: bool
     existing_product_id: str | None
     existing_product_name: str | None
     autolabel: AutolabelResultPublic | None
@@ -88,8 +96,8 @@ class ScaleImagesPage(BaseModel):
 
 
 class AutolabelBatchRequest(BaseModel):
-    object_names: list[str] = Field(min_length=1, max_length=MAX_BATCH_IMAGES)
-    confirm_existing_labels: bool = False
+    object_names: list[str] = Field(default_factory=list, max_length=MAX_BATCH_IMAGES)
+    selection: Literal["explicit", "all_non_empty"] = "explicit"
     retry_only: bool = False
 
 
@@ -122,6 +130,44 @@ class AutolabelTestResult(BaseModel):
     product_id: str | None
     product_name: str | None
     response_sha256: str
+
+
+class ManualLabelRequest(BaseModel):
+    object_name: str = Field(min_length=1, max_length=MAX_OBJECT_NAME_LENGTH)
+    product_id: str = Field(min_length=1, max_length=128)
+
+
+class PendingImageSelection(BaseModel):
+    object_names: list[str] = Field(
+        default_factory=list, max_length=MAX_SELECTED_IMAGES
+    )
+    selection: Literal["explicit", "all_matched"] = "explicit"
+
+
+class SelectionCountRequest(BaseModel):
+    selection: Literal["all_non_empty", "all_matched"]
+
+
+class SelectionCountPublic(BaseModel):
+    count: int
+
+
+class LabelCountPublic(BaseModel):
+    product_id: str
+    product_name: str
+    count: int
+
+
+class LabelCountsPublic(BaseModel):
+    total: int
+    labels: list[LabelCountPublic]
+
+
+class FinalizeJobPublic(BaseModel):
+    job_id: str
+    status: Literal["queued", "processing", "completed", "failed"]
+    moved: int = 0
+    error: str | None = None
 
 
 def _subject(access_token: str) -> str:
@@ -215,11 +261,98 @@ def _result_public(sidecar: AutolabelSidecar | None) -> AutolabelResultPublic | 
     )
 
 
+def _is_empty_image(object_name: str) -> bool:
+    _, capture_index = _parse_session_fields(object_name)
+    return capture_index == 0 or "0000-empty" in object_name.rsplit("/", 1)[-1]
+
+
+def _all_non_empty_image_names() -> list[str]:
+    if not settings.S3_SCALE_BUCKET:
+        raise ValueError("Scale image bucket is not configured")
+    return [
+        item.object_name
+        for item in get_object_storage().list_objects(settings.S3_SCALE_BUCKET)
+        if is_supported_image(item.object_name, item.content_type)
+        and not _is_empty_image(item.object_name)
+    ]
+
+
+def _matched_image_count() -> int:
+    if not settings.S3_SCALE_BUCKET:
+        raise ValueError("Scale image bucket is not configured")
+    storage = get_object_storage()
+    count = 0
+    for item in storage.list_objects(settings.S3_SCALE_BUCKET):
+        if not is_supported_image(item.object_name, item.content_type):
+            continue
+        metadata = storage.head_object(settings.S3_SCALE_BUCKET, item.object_name)
+        sidecar = read_sidecar(item.object_name, source_fingerprint(metadata))
+        if sidecar and sidecar.state == "matched":
+            count += 1
+    return count
+
+
+def _scale_label_counts() -> LabelCountsPublic:
+    if not settings.S3_SCALE_BUCKET:
+        raise ValueError("Scale image bucket is not configured")
+    storage = get_object_storage()
+    total = 0
+    labels: dict[str, tuple[str, int]] = {}
+    for item in storage.list_objects(settings.S3_SCALE_BUCKET):
+        metadata = storage.head_object(settings.S3_SCALE_BUCKET, item.object_name)
+        if not is_supported_image(item.object_name, metadata.content_type):
+            continue
+        total += 1
+        sidecar = read_sidecar(item.object_name, source_fingerprint(metadata))
+        if not sidecar or sidecar.state != "matched" or not sidecar.product_id:
+            continue
+        product_name, count = labels.get(
+            sidecar.product_id, (sidecar.product_name or sidecar.product_id, 0)
+        )
+        labels[sidecar.product_id] = (product_name, count + 1)
+    return LabelCountsPublic(
+        total=total,
+        labels=sorted(
+            (
+                LabelCountPublic(
+                    product_id=product_id,
+                    product_name=product_name,
+                    count=count,
+                )
+                for product_id, (product_name, count) in labels.items()
+            ),
+            key=lambda item: item.product_name.casefold(),
+        ),
+    )
+
+
+@router.post("/images/selection-count", response_model=SelectionCountPublic)
+def selection_count(body: SelectionCountRequest) -> SelectionCountPublic:
+    try:
+        count = (
+            len(_all_non_empty_image_names())
+            if body.selection == "all_non_empty"
+            else _matched_image_count()
+        )
+        return SelectionCountPublic(count=count)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/images/label-counts", response_model=LabelCountsPublic)
+def scale_label_counts() -> LabelCountsPublic:
+    try:
+        return _scale_label_counts()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/images", response_model=ScaleImagesPage)
 def list_scale_images(
     access_token: SuperuserToken,
     cursor: str | None = None,
-    page_size: int = Query(default=24, ge=1, le=50),
+    page_size: int = Query(default=100, ge=1, le=100),
+    label_product_id: str | None = Query(default=None, max_length=128),
 ) -> ScaleImagesPage:
     if not settings.S3_SCALE_BUCKET:
         raise HTTPException(
@@ -227,50 +360,67 @@ def list_scale_images(
         )
     try:
         continuation = decode_cursor(cursor) if cursor else None
-        objects, next_token = get_object_storage().list_objects_page(
-            settings.S3_SCALE_BUCKET,
-            max_keys=page_size,
-            continuation_token=continuation,
-        )
+        storage = get_object_storage()
     except (ValueError, ClientError) as exc:
         raise HTTPException(status_code=422, detail="Invalid image cursor") from exc
 
     active_items = _active_items(access_token)
     images: list[ScaleImagePublic] = []
-    for item in objects:
-        metadata = get_object_storage().head_object(
-            settings.S3_SCALE_BUCKET, item.object_name
-        )
-        if not is_supported_image(item.object_name, metadata.content_type):
-            continue
-        fingerprint = source_fingerprint(metadata)
-        sidecar = read_sidecar(item.object_name, fingerprint)
-        existing_product_id, existing_product_name = manual_label(metadata)
-        session_id, capture_index = _parse_session_fields(item.object_name)
-        active = active_items.get(item.object_name)
-        item_status: ItemStatus
-        if active:
-            item_status = active.status
-        elif sidecar:
-            item_status = sidecar.state
-        else:
-            item_status = "unlabeled"
-        images.append(
-            ScaleImagePublic(
-                object_name=item.object_name,
-                image_url="autolabel/scale/images/content",
-                size=metadata.size,
-                etag=metadata.etag,
-                session_id=session_id,
-                capture_index=capture_index,
-                is_empty=capture_index == 0
-                or "0000-empty" in item.object_name.rsplit("/", 1)[-1],
-                existing_product_id=existing_product_id,
-                existing_product_name=existing_product_name,
-                autolabel=_result_public(sidecar),
-                status=item_status,
+    next_token: str | None = continuation
+    try:
+        while len(images) < page_size:
+            objects, next_token = storage.list_objects_page(
+                settings.S3_SCALE_BUCKET,
+                max_keys=page_size - len(images),
+                continuation_token=next_token,
             )
-        )
+            for item in objects:
+                metadata = storage.head_object(
+                    settings.S3_SCALE_BUCKET, item.object_name
+                )
+                if not is_supported_image(item.object_name, metadata.content_type):
+                    continue
+                fingerprint = source_fingerprint(metadata)
+                sidecar = read_sidecar(item.object_name, fingerprint)
+                if label_product_id and (
+                    sidecar is None or sidecar.product_id != label_product_id
+                ):
+                    continue
+                existing_product_id, existing_product_name = manual_label(metadata)
+                session_id, capture_index = _parse_session_fields(item.object_name)
+                active = active_items.get(item.object_name)
+                item_status: ItemStatus
+                if active:
+                    item_status = active.status
+                elif sidecar:
+                    item_status = sidecar.state
+                else:
+                    item_status = "unlabeled"
+                images.append(
+                    ScaleImagePublic(
+                        object_name=item.object_name,
+                        image_url="autolabel/scale/images/content",
+                        size=metadata.size,
+                        etag=metadata.etag,
+                        session_id=session_id,
+                        capture_index=capture_index,
+                        captured_at=item.last_modified,
+                        is_empty=_is_empty_image(item.object_name),
+                        is_imported=item.object_name.startswith("raw/scale/"),
+                        existing_product_id=existing_product_id,
+                        existing_product_name=existing_product_name,
+                        autolabel=_result_public(sidecar),
+                        status=item_status,
+                    )
+                )
+                if len(images) == page_size:
+                    break
+            if not next_token:
+                break
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not load scale images"
+        ) from exc
     return ScaleImagesPage(
         data=images,
         next_cursor=encode_cursor(next_token) if next_token else None,
@@ -319,8 +469,21 @@ def create_batch(
         alias="Idempotency-Key",
     ),
 ) -> AutolabelBatchPublic:
-    object_names = list(dict.fromkeys(body.object_names))
-    if len(object_names) != len(body.object_names):
+    if body.selection == "all_non_empty":
+        if body.object_names or body.retry_only:
+            raise HTTPException(
+                status_code=422,
+                detail="Bulk autolabel selection cannot include explicit images or retry mode",
+            )
+        try:
+            object_names = _all_non_empty_image_names()
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    else:
+        object_names = list(dict.fromkeys(body.object_names))
+    if not object_names:
+        raise HTTPException(status_code=422, detail="No images matched the selection")
+    if body.selection == "explicit" and len(object_names) != len(body.object_names):
         body = body.model_copy(update={"object_names": object_names})
     try:
         configuration = load_configuration(access_token)
@@ -329,20 +492,12 @@ def create_batch(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    for object_name in object_names:
+    for object_name in object_names if body.selection == "explicit" else []:
         try:
             metadata = require_source_image(object_name)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        existing_product_id, existing_product_name = manual_label(metadata)
         sidecar = read_sidecar(object_name, source_fingerprint(metadata))
-        if (
-            existing_product_id or existing_product_name
-        ) and not body.confirm_existing_labels:
-            raise HTTPException(
-                status_code=409,
-                detail="Existing image labels require explicit confirmation",
-            )
         if body.retry_only and (sidecar is None or sidecar.state == "matched"):
             raise HTTPException(
                 status_code=409,
@@ -388,7 +543,10 @@ def create_batch(
             job_timeout=JOB_TIMEOUT,
             result_ttl=JOB_RETENTION_SECONDS,
             failure_ttl=JOB_RETENTION_SECONDS,
-            meta=initial_job_meta(object_names),
+            meta=initial_job_meta(
+                object_names,
+                include_items=body.selection == "explicit",
+            ),
             description=f"Autolabel {len(object_names)} scale images",
         )
         redis.set(
@@ -467,3 +625,156 @@ def test_endpoint(
         product_name=selected.name if selected else None,
         response_sha256=result.response_sha256,
     )
+
+
+@router.patch("/images/label", response_model=ScaleImagePublic)
+def update_image_label(
+    body: ManualLabelRequest,
+    access_token: SuperuserToken,
+) -> ScaleImagePublic:
+    try:
+        catalog = load_catalog(access_token)
+        product = next(
+            (
+                candidate
+                for candidate in catalog
+                if candidate.product_id == body.product_id
+            ),
+            None,
+        )
+        if product is None:
+            raise ValueError("Selected product does not exist")
+        metadata = require_source_image(body.object_name)
+        existing_product_id, existing_product_name = manual_label(metadata)
+        session_id, capture_index = _parse_session_fields(body.object_name)
+        sidecar = AutolabelSidecar(
+            bucket=settings.S3_SCALE_BUCKET,
+            object_name=body.object_name,
+            source_size=metadata.size,
+            source_fingerprint=source_fingerprint(metadata),
+            product_id=product.product_id,
+            product_name=product.name,
+            state="matched",
+            timestamp=datetime.now(UTC),
+            batch_id=f"manual-{uuid4()}",
+            endpoint_url="manual",
+            max_tokens=1,
+        )
+        from app.core.autolabel import write_sidecar
+
+        write_sidecar(sidecar)
+        return ScaleImagePublic(
+            object_name=body.object_name,
+            image_url="autolabel/scale/images/content",
+            size=metadata.size,
+            etag=metadata.etag,
+            session_id=session_id,
+            capture_index=capture_index,
+            captured_at=None,
+            is_empty=_is_empty_image(body.object_name),
+            is_imported=body.object_name.startswith("raw/scale/"),
+            existing_product_id=existing_product_id,
+            existing_product_name=existing_product_name,
+            autolabel=_result_public(sidecar),
+            status="matched",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _selected_pending_rows(
+    object_names: list[str],
+) -> list[tuple[str, str, str, AutolabelSidecar]]:
+    rows: list[tuple[str, str, str, AutolabelSidecar]] = []
+    for object_name in list(dict.fromkeys(object_names)):
+        metadata = require_source_image(object_name)
+        sidecar = read_sidecar(object_name, source_fingerprint(metadata))
+        if not sidecar or sidecar.state != "matched" or not sidecar.product_name:
+            raise ValueError(f"Image has no completed Label: {object_name}")
+        rows.append(
+            (settings.S3_SCALE_BUCKET, object_name, sidecar.product_name, sidecar)
+        )
+    return rows
+
+
+@router.post("/images/finalize")
+def finalize_pending_images(
+    body: PendingImageSelection, access_token: SuperuserToken
+) -> dict:
+    del access_token
+    storage = get_object_storage()
+    try:
+        if body.selection == "all_matched":
+            if body.object_names:
+                raise ValueError(
+                    "Matched selection cannot include explicit image names"
+                )
+            job = get_autolabel_queue().enqueue(
+                run_finalize_all_matched,
+                job_timeout=JOB_TIMEOUT,
+                result_ttl=JOB_RETENTION_SECONDS,
+                failure_ttl=JOB_RETENTION_SECONDS,
+                meta={"status": "queued", "moved": 0},
+                description="Move all matched images to the labeled collection",
+            )
+            return {"queued": True, "job_id": job.id}
+        else:
+            rows = _selected_pending_rows(body.object_names)
+        if not rows:
+            raise ValueError("No matched images selected")
+        moved: list[str] = []
+        moved_count = 0
+        for bucket, object_name, _, sidecar in rows:
+            metadata = storage.head_object(bucket, object_name)
+            target = labeled_object_name(
+                object_name.rsplit("/", 1)[-1],
+                metadata.content_type or "application/octet-stream",
+            )
+            storage.copy_object(
+                source_bucket=bucket,
+                source_object=object_name,
+                target_bucket=settings.S3_EXTERNAL_BUCKET,
+                target_object=target,
+                content_type=metadata.content_type or "application/octet-stream",
+                metadata=label_metadata(
+                    sidecar.product_id or "", sidecar.product_name or ""
+                ),
+            )
+            storage.delete_objects(
+                bucket,
+                [object_name, sidecar_object_name(object_name)],
+            )
+            moved_count += 1
+            if body.selection == "explicit":
+                moved.append(target)
+        return {"moved": moved_count, "object_names": moved}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/images/finalize/{job_id}", response_model=FinalizeJobPublic)
+def finalize_job_status(job_id: str) -> FinalizeJobPublic:
+    try:
+        job = Job.fetch(job_id, connection=get_autolabel_queue().connection)
+        rq_status = job.get_status(refresh=True)
+        meta = job.meta or {}
+        if rq_status in {"failed", "stopped", "canceled"}:
+            public_status = "failed"
+        elif rq_status == "finished":
+            public_status = "completed"
+        elif rq_status in {"started", "busy"}:
+            public_status = "processing"
+        else:
+            public_status = "queued"
+        return FinalizeJobPublic(
+            job_id=job.id,
+            status=public_status,
+            moved=int(meta.get("moved") or 0),
+            error=str(meta.get("error")) if meta.get("error") else None,
+        )
+    except NoSuchJobError as exc:
+        raise HTTPException(status_code=404, detail="Move job not found") from exc
+    except RedisError as exc:
+        raise HTTPException(
+            status_code=503, detail="Move queue is unavailable"
+        ) from exc
