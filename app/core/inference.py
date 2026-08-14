@@ -1,356 +1,214 @@
 from __future__ import annotations
 
+import io
 import json
-import os
 import threading
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
 
+from botocore.exceptions import ClientError
 from fastapi import HTTPException
 
 from app.core.config import settings
+from app.core.object_storage import get_object_storage
 
-if TYPE_CHECKING:
-    from mlflow.entities.model_registry import ModelVersion
-
-
-def configure_local_caches() -> None:
-    local_cache_dir = Path(".cache")
-    os.environ.setdefault("XDG_CACHE_HOME", str(local_cache_dir.resolve()))
-    os.environ.setdefault(
-        "MPLCONFIGDIR",
-        str((local_cache_dir / "matplotlib").resolve()),
-    )
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "120")
-    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
+MODEL_PREFIX = "models"
 
 
-class RegistryModelStore:
-    def __init__(
-        self,
-        *,
-        registered_model_name: str,
-        cache_prefix: str,
-    ) -> None:
-        import mlflow
-        from mlflow.tracking import MlflowClient
+class ObjectStorageModelStore:
+    """Small model registry backed only by the configured S3-compatible store."""
 
-        configure_local_caches()
-        self._client: Any | None = None
-        if settings.MLFLOW_TRACKING_URI:
-            mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
-            self._client = MlflowClient(tracking_uri=settings.MLFLOW_TRACKING_URI)
-        self._registered_model_name = registered_model_name
-        self._cache_prefix = cache_prefix
-        self._cached_cache_key: str | None = None
-        self._cached_run_id: str | None = None
+    def __init__(self, *, model_name: str) -> None:
+        self.model_name = model_name
+        self._lock = threading.Lock()
+        self._cached_version: int | None = None
         self._cached_model: Any | None = None
-        self._cached_labels: list[str] | None = None
-        self._cached_image_size: int | None = None
-        self._refresh_lock = threading.Lock()
-        self._cache_dir = Path(settings.MODEL_CACHE_DIR)
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cached_metadata: dict[str, Any] | None = None
 
-    def _require_client(self) -> Any:
-        if self._client is None:
-            raise HTTPException(
-                status_code=503,
-                detail="MLflow is disabled because MLFLOW_TRACKING_URI is not configured.",
+    @property
+    def _versions_prefix(self) -> str:
+        return f"{MODEL_PREFIX}/{self.model_name}/versions"
+
+    @property
+    def _active_object(self) -> str:
+        return f"{MODEL_PREFIX}/{self.model_name}/active.json"
+
+    def _metadata_object(self, version: int) -> str:
+        return f"{self._versions_prefix}/{version}/metadata.json"
+
+    def _model_object(self, version: int) -> str:
+        return f"{self._versions_prefix}/{version}/model.joblib"
+
+    def _read_json(self, object_name: str) -> dict[str, Any] | None:
+        try:
+            body = get_object_storage().get_bytes(
+                settings.S3_TRAINING_BUCKET, object_name
             )
-        return self._client
+        except ClientError as exc:
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status == 404:
+                return None
+            raise
+        value = json.loads(body)
+        return value if isinstance(value, dict) else None
 
-    def _disk_model_path(self) -> Path:
-        return self._cache_dir / f"{self._cache_prefix}.pkl"
+    def _write_json(self, object_name: str, value: dict[str, Any]) -> None:
+        get_object_storage().put_bytes(
+            settings.S3_TRAINING_BUCKET,
+            object_name,
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(),
+            content_type="application/json",
+        )
 
-    def _disk_metadata_path(self) -> Path:
-        return self._cache_dir / f"{self._cache_prefix}_metadata.json"
+    def list_versions(self) -> list[dict[str, Any]]:
+        storage = get_object_storage()
+        if not storage.bucket_exists(settings.S3_TRAINING_BUCKET):
+            return []
+        active = self._read_json(self._active_object) or {}
+        active_version = active.get("version")
+        versions: list[dict[str, Any]] = []
+        for item in storage.list_objects(
+            settings.S3_TRAINING_BUCKET, prefix=f"{self._versions_prefix}/"
+        ):
+            if not item.object_name.endswith("/metadata.json"):
+                continue
+            metadata = self._read_json(item.object_name)
+            if not metadata:
+                continue
+            metadata["is_active"] = metadata.get("version") == active_version
+            versions.append(metadata)
+        return sorted(versions, key=lambda value: int(value["version"]), reverse=True)
 
-    def _write_disk_cache(
+    def register(
         self,
         *,
         model: Any,
         labels: list[str],
-        run_id: str,
-        registered_model_name: str,
-        registered_model_version: str,
         image_size: int,
-    ) -> None:
+        metrics: dict[str, float],
+        parameters: dict[str, Any],
+        activate: bool = True,
+    ) -> dict[str, Any]:
         import joblib
 
-        joblib.dump(model, self._disk_model_path())
-        self._disk_metadata_path().write_text(
-            json.dumps(
-                {
-                    "labels": labels,
-                    "run_id": run_id,
-                    "registered_model_name": registered_model_name,
-                    "registered_model_version": registered_model_version,
-                    "image_size": image_size,
-                    "model_flavor": "sklearn",
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    def _load_from_disk_cache(self) -> tuple[Any, list[str], str, int] | None:
-        model_path = self._disk_model_path()
-        metadata_path = self._disk_metadata_path()
-        if not model_path.exists() or not metadata_path.exists():
-            return None
-
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        labels = metadata.get("labels")
-        run_id = metadata.get("run_id")
-        registered_model_name = metadata.get("registered_model_name")
-        registered_model_version = metadata.get("registered_model_version")
-        image_size = metadata.get("image_size")
-        if (
-            not isinstance(labels, list)
-            or not labels
-            or not isinstance(run_id, str)
-            or not isinstance(registered_model_name, str)
-            or not isinstance(registered_model_version, str)
-            or not isinstance(image_size, int)
-        ):
-            return None
-
-        import joblib
-
-        model = joblib.load(model_path)
-        self._cached_run_id = run_id
-        self._cached_cache_key = f"{registered_model_name}:{registered_model_version}"
-        self._cached_model = model
-        self._cached_labels = labels
-        self._cached_image_size = image_size
-        return model, labels, run_id, image_size
-
-    def _latest_registered_model(self) -> ModelVersion:
-        from mlflow.exceptions import MlflowException
-
-        try:
-            versions = list(
-                self._require_client().search_model_versions(
-                    f"name='{self._registered_model_name}'"
-                )
+        with self._lock:
+            versions = self.list_versions()
+            version = max((int(item["version"]) for item in versions), default=0) + 1
+            model_id = str(uuid4())
+            created_at = datetime.now(UTC).isoformat()
+            buffer = io.BytesIO()
+            joblib.dump(model, buffer)
+            get_object_storage().put_bytes(
+                settings.S3_TRAINING_BUCKET,
+                self._model_object(version),
+                buffer.getvalue(),
+                content_type="application/octet-stream",
             )
-        except MlflowException as error:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "MLflow is unavailable or misconfigured. "
-                    f"Tracking URI: {settings.MLFLOW_TRACKING_URI}."
-                ),
-            ) from error
-
-        if not versions:
-            raise HTTPException(
-                status_code=503,
-                detail=f"No registered model found in MLflow for {self._registered_model_name}.",
-            )
-
-        return max(versions, key=lambda version: int(version.version))
-
-    def _load_from_registry(
-        self, latest_version: ModelVersion
-    ) -> tuple[Any, list[str], int]:
-        from mlflow.models import get_model_info
-
-        model_uri = f"models:/{latest_version.name}/{latest_version.version}"
-        try:
-            model_info = get_model_info(model_uri)
-            metadata = model_info.metadata or {}
-            labels = metadata.get("labels")
-            if not isinstance(labels, list) or not labels:
-                raise ValueError("Missing labels in MLflow model metadata")
-            image_size = metadata.get("image_size")
-            if not isinstance(image_size, int):
-                raise ValueError("Missing image size in MLflow model metadata")
-            import mlflow.sklearn
-
-            model = mlflow.sklearn.load_model(model_uri)
-        except Exception as error:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Failed to load model from MLflow: {type(error).__name__}: {error}",
-            ) from error
-        return model, labels, image_size
-
-    def _ensure_loaded(self) -> tuple[Any, list[str], str, int]:
-        if (
-            self._cached_model is not None
-            and self._cached_labels
-            and self._cached_run_id
-            and self._cached_cache_key
-            and self._cached_image_size
-        ):
-            return (
-                self._cached_model,
-                self._cached_labels,
-                self._cached_run_id,
-                self._cached_image_size,
-            )
-
-        disk_cached = self._load_from_disk_cache()
-        if disk_cached is not None:
-            return disk_cached
-
-        latest_version = self._latest_registered_model()
-        model, labels, image_size = self._load_from_registry(latest_version)
-
-        self._write_disk_cache(
-            model=model,
-            labels=labels,
-            run_id=latest_version.run_id,
-            registered_model_name=latest_version.name,
-            registered_model_version=latest_version.version,
-            image_size=image_size,
-        )
-        self._cached_cache_key = f"{latest_version.name}:{latest_version.version}"
-        self._cached_run_id = latest_version.run_id
-        self._cached_model = model
-        self._cached_labels = labels
-        self._cached_image_size = image_size
-        return model, labels, latest_version.run_id, image_size
-
-    def _active_cache_key(self) -> str | None:
-        if self._cached_cache_key:
-            return self._cached_cache_key
-        metadata_path = self._disk_metadata_path()
-        if not metadata_path.exists():
-            return None
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            name = metadata.get("registered_model_name")
-            version = metadata.get("registered_model_version")
-            if name and version:
-                return f"{name}:{version}"
-        except Exception:
-            pass
-        return None
-
-    def list_versions(self) -> list[dict]:
-        from mlflow.exceptions import MlflowException
-
-        try:
-            versions = list(
-                self._require_client().search_model_versions(
-                    f"name='{self._registered_model_name}'"
-                )
-            )
-        except MlflowException as error:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "MLflow is unavailable or misconfigured. "
-                    f"Tracking URI: {settings.MLFLOW_TRACKING_URI}."
-                ),
-            ) from error
-
-        active_key = self._active_cache_key()
-        result = []
-        for v in sorted(versions, key=lambda v: int(v.version), reverse=True):
-            cache_key = f"{v.name}:{v.version}"
-            result.append(
-                {
-                    "name": v.name,
-                    "version": int(v.version),
-                    "run_id": v.run_id,
-                    "status": v.status,
-                    "description": v.description or None,
-                    "created_at": (
-                        str(v.creation_timestamp) if v.creation_timestamp else None
-                    ),
-                    "is_active": cache_key == active_key,
-                }
-            )
-        return result
-
-    def set_version(self, version: int) -> dict:
-        from mlflow.exceptions import MlflowException
-
-        with self._refresh_lock:
-            # Load from disk cache if the requested version is already cached there
-            metadata_path = self._disk_metadata_path()
-            if metadata_path.exists():
-                try:
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                    if str(metadata.get("registered_model_version")) == str(version):
-                        disk = self._load_from_disk_cache()
-                        if disk is not None:
-                            return {
-                                "model_name": self._registered_model_name,
-                                "model_version": version,
-                                "run_id": self._cached_run_id or "",
-                                "cache_key": self._cached_cache_key or "",
-                            }
-                except Exception:
-                    pass
-
-            # Not on disk — fetch from MLflow registry
-            try:
-                target = self._require_client().get_model_version(
-                    self._registered_model_name, str(version)
-                )
-            except MlflowException as error:
-                raise HTTPException(
-                    status_code=404 if "RESOURCE_DOES_NOT_EXIST" in str(error) else 503,
-                    detail=f"Version {version} not found for model {self._registered_model_name}."
-                    if "RESOURCE_DOES_NOT_EXIST" in str(error)
-                    else f"MLflow error: {type(error).__name__}: {error}",
-                ) from error
-            try:
-                model, labels, image_size = self._load_from_registry(target)
-            except HTTPException:
-                raise
-            except Exception as error:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Failed to load model: {type(error).__name__}: {error}",
-                ) from error
-
-            cache_key = f"{target.name}:{target.version}"
-            self._write_disk_cache(
-                model=model,
-                labels=labels,
-                run_id=target.run_id,
-                registered_model_name=target.name,
-                registered_model_version=target.version,
-                image_size=image_size,
-            )
-            self._cached_cache_key = cache_key
-            self._cached_run_id = target.run_id
-            self._cached_model = model
-            self._cached_labels = labels
-            self._cached_image_size = image_size
-
-            return {
-                "model_name": target.name,
-                "model_version": int(target.version),
-                "run_id": target.run_id,
-                "cache_key": cache_key,
+            metadata: dict[str, Any] = {
+                "name": self.model_name,
+                "version": version,
+                "model_id": model_id,
+                "status": "ready",
+                "description": None,
+                "created_at": created_at,
+                "labels": labels,
+                "image_size": image_size,
+                "metrics": metrics,
+                "parameters": parameters,
+                "artifact_object": self._model_object(version),
             }
+            self._write_json(self._metadata_object(version), metadata)
+            if activate:
+                self._activate(version, metadata)
+            return {**metadata, "is_active": activate}
+
+    def _activate(self, version: int, metadata: dict[str, Any]) -> None:
+        self._write_json(
+            self._active_object,
+            {
+                "version": version,
+                "model_id": metadata["model_id"],
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        self._cached_version = None
+        self._cached_model = None
+        self._cached_metadata = None
+
+    def set_version(self, version: int) -> dict[str, Any]:
+        with self._lock:
+            metadata = self._read_json(self._metadata_object(version))
+            if metadata is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Version {version} not found for model {self.model_name}",
+                )
+            self._activate(version, metadata)
+            return {
+                "model_name": self.model_name,
+                "model_version": version,
+                "model_id": metadata["model_id"],
+                "cache_key": f"{self.model_name}:{version}",
+            }
+
+    def _load_active(self) -> tuple[Any, dict[str, Any]]:
+        import joblib
+
+        active = self._read_json(self._active_object)
+        if not active or not isinstance(active.get("version"), int):
+            raise HTTPException(
+                status_code=503,
+                detail=f"No active model is configured for {self.model_name}",
+            )
+        version = int(active["version"])
+        if self._cached_version == version and self._cached_model is not None:
+            assert self._cached_metadata is not None
+            return self._cached_model, self._cached_metadata
+        metadata = self._read_json(self._metadata_object(version))
+        if not metadata:
+            raise HTTPException(
+                status_code=503, detail="Active model metadata is missing"
+            )
+        try:
+            payload = get_object_storage().get_bytes(
+                settings.S3_TRAINING_BUCKET, self._model_object(version)
+            )
+            model = joblib.load(io.BytesIO(payload))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="Active model artifact could not be loaded"
+            ) from exc
+        self._cached_version = version
+        self._cached_model = model
+        self._cached_metadata = metadata
+        return model, metadata
 
     def predict(self, image_bytes: bytes) -> tuple[dict[str, float], str]:
         import cv2
         import numpy as np
 
-        model, labels, run_id, image_size = self._ensure_loaded()
-
+        model, metadata = self._load_active()
+        labels = metadata.get("labels")
+        image_size = metadata.get("image_size")
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or not isinstance(image_size, int)
+        ):
+            raise HTTPException(
+                status_code=503, detail="Active model metadata is invalid"
+            )
         array = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(array, cv2.IMREAD_COLOR)
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid image file")
-
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(
-            rgb,
-            (image_size, image_size),
-            interpolation=cv2.INTER_AREA,
+            rgb, (image_size, image_size), interpolation=cv2.INTER_AREA
         )
         normalized = resized.astype(np.float32) / 255.0
-        batch = np.expand_dims(normalized, axis=0)
-        probabilities = model.predict_proba(batch.reshape(1, -1))[0]
+        probabilities = model.predict_proba(normalized.reshape(1, -1))[0]
         scores = dict(
             sorted(
                 (
@@ -361,15 +219,8 @@ class RegistryModelStore:
                 reverse=True,
             )
         )
-        return scores, run_id
+        return scores, str(metadata["model_id"])
 
 
-classifier_model_store = RegistryModelStore(
-    registered_model_name=settings.MLFLOW_REGISTERED_MODEL_NAME,
-    cache_prefix="classifier_model",
-)
-
-shelf_model_store = RegistryModelStore(
-    registered_model_name=settings.MLFLOW_SHELF_MODEL_NAME,
-    cache_prefix="shelf_model",
-)
+classifier_model_store = ObjectStorageModelStore(model_name="classifier")
+shelf_model_store = ObjectStorageModelStore(model_name="detector")

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SessionSnapshotPublic(BaseModel):
@@ -19,17 +19,19 @@ class SessionSnapshotListPublic(BaseModel):
 
 class PredictionPublic(BaseModel):
     scores: dict[str, float]
-    run_id: str
+    model_id: str
 
 
 class ModelVersionPublic(BaseModel):
     name: str
     version: int
-    run_id: str
+    model_id: str
     status: str
     description: str | None = None
     created_at: str | None = None
     is_active: bool = False
+    metrics: dict[str, float] = Field(default_factory=dict)
+    parameters: dict = Field(default_factory=dict)
 
 
 class SetModelRequest(BaseModel):
@@ -39,7 +41,7 @@ class SetModelRequest(BaseModel):
 class ModelActivatedPublic(BaseModel):
     model_name: str
     model_version: int
-    run_id: str
+    model_id: str
     cache_key: str
 
 

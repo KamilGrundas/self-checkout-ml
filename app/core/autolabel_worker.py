@@ -8,9 +8,16 @@ from rq import get_current_job
 from app.core.autolabel import (
     AutolabelConfiguration,
     CatalogCandidate,
+    is_supported_image,
     process_image,
+    read_sidecar,
+    sidecar_object_name,
+    source_fingerprint,
     write_failed_sidecar,
 )
+from app.core.config import settings
+from app.core.labeled_images import label_metadata, labeled_object_name
+from app.core.object_storage import get_object_storage
 
 
 def _save_meta(meta: dict[str, Any]) -> None:
@@ -31,6 +38,7 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
     job = get_current_job()
     meta = dict(job.meta) if job is not None else {}
     items = list(meta.get("items") or [])
+    detailed_items = len(items) == len(body["object_names"])
     configuration = AutolabelConfiguration.model_validate(body["configuration"])
     catalog = [CatalogCandidate.model_validate(item) for item in body["catalog"]]
     batch_id = str(body["batch_id"])
@@ -38,10 +46,11 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
     _save_meta(meta)
 
     for index, object_name in enumerate(body["object_names"]):
-        item = items[index]
-        item["status"] = "processing"
-        meta["items"] = items
-        _save_meta(meta)
+        item = items[index] if detailed_items else None
+        if item is not None:
+            item["status"] = "processing"
+            meta["items"] = items
+            _save_meta(meta)
         try:
             sidecar = process_image(
                 object_name=object_name,
@@ -49,12 +58,14 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
                 configuration=configuration,
                 catalog=catalog,
             )
-            item.update(
-                status=sidecar.state,
-                product_id=sidecar.product_id,
-                product_name=sidecar.product_name,
-                error=None,
-            )
+            if item is not None:
+                item.update(
+                    status=sidecar.state,
+                    product_id=sidecar.product_id,
+                    product_name=sidecar.product_name,
+                    error=None,
+                )
+            meta[sidecar.state] = int(meta.get(sidecar.state) or 0) + 1
         except Exception as exc:
             error = _safe_error(exc)
             write_failed_sidecar(
@@ -63,19 +74,53 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
                 configuration=configuration,
                 error=error,
             )
-            item.update(
-                status="failed",
-                product_id=None,
-                product_name=None,
-                error=error,
-            )
+            if item is not None:
+                item.update(
+                    status="failed",
+                    product_id=None,
+                    product_name=None,
+                    error=error,
+                )
+            meta["failed"] = int(meta.get("failed") or 0) + 1
         meta["completed"] = index + 1
-        meta["matched"] = sum(i["status"] == "matched" for i in items)
-        meta["unmatched"] = sum(i["status"] == "unmatched" for i in items)
-        meta["failed"] = sum(i["status"] == "failed" for i in items)
         meta["items"] = items
         _save_meta(meta)
 
     meta["status"] = "completed"
     _save_meta(meta)
     return meta
+
+
+def run_finalize_all_matched() -> dict[str, int]:
+    if not settings.S3_SCALE_BUCKET or not settings.S3_EXTERNAL_BUCKET:
+        raise RuntimeError("Image buckets are not configured")
+    storage = get_object_storage()
+    moved = 0
+    for item in storage.list_objects(settings.S3_SCALE_BUCKET):
+        if not is_supported_image(item.object_name, item.content_type):
+            continue
+        metadata = storage.head_object(settings.S3_SCALE_BUCKET, item.object_name)
+        sidecar = read_sidecar(item.object_name, source_fingerprint(metadata))
+        if not sidecar or sidecar.state != "matched" or not sidecar.product_name:
+            continue
+        target = labeled_object_name(
+            item.object_name.rsplit("/", 1)[-1],
+            metadata.content_type or "application/octet-stream",
+        )
+        storage.copy_object(
+            source_bucket=settings.S3_SCALE_BUCKET,
+            source_object=item.object_name,
+            target_bucket=settings.S3_EXTERNAL_BUCKET,
+            target_object=target,
+            content_type=metadata.content_type or "application/octet-stream",
+            metadata=label_metadata(sidecar.product_id or "", sidecar.product_name),
+        )
+        storage.delete_objects(
+            settings.S3_SCALE_BUCKET,
+            [item.object_name, sidecar_object_name(item.object_name)],
+        )
+        moved += 1
+        _save_meta({"status": "processing", "moved": moved})
+    result = {"moved": moved}
+    _save_meta({"status": "completed", **result})
+    return result

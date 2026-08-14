@@ -174,6 +174,25 @@ class S3ObjectStorage:
             if errors := response.get("Errors"):
                 raise RuntimeError(f"Failed to delete some S3 objects: {errors}")
 
+    def copy_object(
+        self,
+        *,
+        source_bucket: str,
+        source_object: str,
+        target_bucket: str,
+        target_object: str,
+        content_type: str,
+        metadata: dict[str, str],
+    ) -> None:
+        self.client.copy_object(
+            Bucket=target_bucket,
+            Key=target_object,
+            CopySource={"Bucket": source_bucket, "Key": source_object},
+            ContentType=content_type,
+            Metadata=metadata,
+            MetadataDirective="REPLACE",
+        )
+
 
 @lru_cache
 def get_object_storage() -> S3ObjectStorage:
@@ -213,7 +232,6 @@ def ensure_default_buckets_exist() -> None:
         settings.S3_SCALE_BUCKET,
         settings.S3_EXTERNAL_BUCKET,
         settings.S3_TRAINING_BUCKET,
-        settings.S3_LABEL_STUDIO_EXPORT_BUCKET,
     ):
         if bucket_name is None:
             raise RuntimeError("All ML S3 bucket names are required")

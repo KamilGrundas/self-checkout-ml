@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import jwt
@@ -10,6 +11,7 @@ from app.api.routes import autolabel_scale
 from app.core import autolabel
 from app.core.autolabel import (
     AutolabelConfiguration,
+    AutolabelSidecar,
     CatalogCandidate,
 )
 from app.core.object_storage import S3Object, S3ObjectMetadata
@@ -42,7 +44,12 @@ class PageStorage:
                 {"ResponseMetadata": {"HTTPStatusCode": 400}},
                 "ListObjectsV2",
             )
+        if kwargs.get("continuation_token") == "next-token":
+            return [], None
         return self.objects, "next-token"
+
+    def list_objects(self, bucket: str):
+        yield from self.objects
 
     def head_object(self, bucket: str, object_name: str) -> S3ObjectMetadata:
         content_type = (
@@ -79,7 +86,9 @@ def test_paginated_list_contains_only_scale_images(
     monkeypatch.setattr(autolabel_scale, "_active_items", lambda token: {})
     monkeypatch.setattr(autolabel_scale.settings, "S3_SCALE_BUCKET", "scale")
 
-    page = autolabel_scale.list_scale_images(token(), page_size=24)
+    page = autolabel_scale.list_scale_images(
+        token(), page_size=100, label_product_id=None
+    )
 
     assert [item.object_name for item in page.data] == [
         "sessions/s1/captures/0000-empty.jpg",
@@ -87,10 +96,51 @@ def test_paginated_list_contains_only_scale_images(
         "raw/scale/upload.png",
     ]
     assert page.data[0].is_empty is True
+    assert page.data[0].is_imported is False
     assert page.data[1].capture_index == 1
     assert page.data[1].existing_product_name == "Jabłko"
+    assert page.data[2].is_imported is True
     assert page.data[0].image_url == "autolabel/scale/images/content"
-    assert autolabel_scale.decode_cursor(page.next_cursor or "") == "next-token"
+    assert page.next_cursor is None
+
+
+def test_scale_images_are_counted_and_filtered_by_autolabel_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = PageStorage()
+
+    def sidecar(object_name: str, fingerprint: str):
+        if "0001-product" not in object_name:
+            return None
+        return AutolabelSidecar(
+            bucket="scale",
+            object_name=object_name,
+            source_size=20,
+            source_fingerprint=fingerprint,
+            product_id="apple-id",
+            product_name="Apple",
+            state="matched",
+            timestamp=datetime.now(UTC),
+            batch_id="batch-1",
+            endpoint_url="test",
+            max_tokens=1,
+        )
+
+    monkeypatch.setattr(autolabel_scale, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(autolabel_scale, "read_sidecar", sidecar)
+    monkeypatch.setattr(autolabel_scale, "_active_items", lambda token: {})
+    monkeypatch.setattr(autolabel_scale.settings, "S3_SCALE_BUCKET", "scale")
+
+    counts = autolabel_scale.scale_label_counts()
+    page = autolabel_scale.list_scale_images(
+        token(), page_size=100, label_product_id="apple-id"
+    )
+
+    assert counts.total == 3
+    assert [(item.product_name, item.count) for item in counts.labels] == [("Apple", 1)]
+    assert [item.object_name for item in page.data] == [
+        "sessions/s1/captures/0001-product.jpg"
+    ]
 
 
 def test_scale_image_content_is_returned_through_authenticated_api(
@@ -113,7 +163,9 @@ def test_scale_image_content_is_returned_through_authenticated_api(
 def test_invalid_cursor_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(autolabel_scale.settings, "S3_SCALE_BUCKET", "scale")
     with pytest.raises(HTTPException) as error:
-        autolabel_scale.list_scale_images(token(), cursor="!!", page_size=24)
+        autolabel_scale.list_scale_images(
+            token(), cursor="!!", page_size=24, label_product_id=None
+        )
     assert error.value.status_code == 422
 
 
@@ -191,7 +243,11 @@ def test_batch_enqueue_deduplicates_objects_and_is_idempotent(
         "require_source_image",
         lambda name: S3ObjectMetadata("image/jpeg", {}, 10, "etag"),
     )
-    monkeypatch.setattr(autolabel_scale, "read_sidecar", lambda *args: None)
+    monkeypatch.setattr(
+        autolabel_scale,
+        "read_sidecar",
+        lambda *args: type("Sidecar", (), {"state": "matched"})(),
+    )
     monkeypatch.setattr(
         autolabel_scale.Job,
         "fetch",
@@ -208,8 +264,25 @@ def test_batch_enqueue_deduplicates_objects_and_is_idempotent(
     assert first.total == 2
     assert queue.enqueue_count == 1
 
+    class BulkStorage:
+        def list_objects(self, bucket: str):
+            yield S3Object("sessions/s1/captures/0000-empty.jpg", 10, etag="empty")
+            for index in range(50_000):
+                yield S3Object(f"raw/scale/image-{index}.jpg", 10, etag=str(index))
 
-def test_batch_rejects_invalid_object_and_existing_manual_label(
+    monkeypatch.setattr(autolabel_scale, "get_object_storage", lambda: BulkStorage())
+    bulk = autolabel_scale.create_batch(
+        autolabel_scale.AutolabelBatchRequest(selection="all_non_empty"),
+        token(),
+        "request-key-bulk",
+    )
+
+    assert bulk.total == 50_000
+    assert bulk.items == []
+    assert queue.enqueue_count == 2
+
+
+def test_batch_rejects_invalid_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -247,22 +320,3 @@ def test_batch_rejects_invalid_object_and_existing_manual_label(
             "request-key-123",
         )
     assert invalid_error.value.status_code == 422
-
-    monkeypatch.setattr(
-        autolabel_scale,
-        "require_source_image",
-        lambda name: S3ObjectMetadata(
-            "image/jpeg",
-            {"product-name": "Jab%C5%82ko"},
-            10,
-            "etag",
-        ),
-    )
-    monkeypatch.setattr(autolabel_scale, "read_sidecar", lambda *args: None)
-    with pytest.raises(HTTPException) as error:
-        autolabel_scale.create_batch(
-            autolabel_scale.AutolabelBatchRequest(object_names=["one.jpg"]),
-            token(),
-            "request-key-123",
-        )
-    assert error.value.status_code == 409
