@@ -82,6 +82,10 @@ class ImageLabelUpdate(BaseModel):
     product_id: str = Field(min_length=1, max_length=128)
 
 
+class ImageDeleteRequest(BaseModel):
+    object_names: list[str] = Field(min_length=1, max_length=MAX_SELECTED_IMAGES)
+
+
 class DuplicateScanPublic(BaseModel):
     job_id: str
     status: Literal["queued", "processing", "completed", "failed"]
@@ -390,6 +394,23 @@ async def update_labeled_image(
         product_id=product.product_id,
         product_name=product.name,
     )
+
+
+@router.delete("/images")
+async def delete_labeled_images(body: ImageDeleteRequest) -> dict[str, int]:
+    storage = get_object_storage()
+    selected = list(dict.fromkeys(body.object_names))
+    try:
+        for object_name in selected:
+            if not object_name.startswith("labeled/"):
+                raise ValueError("Invalid labeled image object name")
+            storage.head_object(settings.S3_EXTERNAL_BUCKET, object_name)
+        storage.delete_objects(settings.S3_EXTERNAL_BUCKET, selected)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Labeled image not found") from exc
+    return {"deleted": len(selected)}
 
 
 @router.post("/images/export")

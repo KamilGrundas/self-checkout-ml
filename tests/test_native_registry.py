@@ -39,6 +39,10 @@ class MemoryStorage:
     def head_object(self, bucket: str, object_name: str) -> S3ObjectMetadata:
         return S3ObjectMetadata("image/jpeg", {}, size=10, etag="etag")
 
+    def delete_objects(self, bucket: str, object_names: list[str]) -> None:
+        for object_name in object_names:
+            self.objects.pop((bucket, object_name), None)
+
     def copy_object(
         self,
         *,
@@ -77,6 +81,37 @@ def test_native_model_registry_stores_metrics_and_active_version(monkeypatch) ->
     assert versions[0]["is_active"] is True
     active = json.loads(storage.objects[("training", "models/classifier/active.json")])
     assert active["version"] == 1
+
+
+def test_native_model_registry_deletes_model_and_activates_latest_remaining(
+    monkeypatch,
+) -> None:
+    storage = MemoryStorage()
+    monkeypatch.setattr(inference, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(inference.settings, "S3_TRAINING_BUCKET", "training")
+    store = inference.ObjectStorageModelStore(model_name="classifier")
+
+    first = store.register(
+        model=SerializableModel("first"),
+        labels=["Apple"],
+        image_size=32,
+        metrics={},
+        parameters={},
+    )
+    second = store.register(
+        model=SerializableModel("second"),
+        labels=["Apple"],
+        image_size=32,
+        metrics={},
+        parameters={},
+    )
+
+    result = store.delete_version(second["version"])
+
+    assert result["model_id"] == second["model_id"]
+    versions = store.list_versions()
+    assert [item["model_id"] for item in versions] == [first["model_id"]]
+    assert versions[0]["is_active"] is True
 
 
 def test_export_selected_images_creates_self_contained_csv_dataset(monkeypatch) -> None:

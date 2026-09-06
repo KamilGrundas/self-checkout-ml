@@ -137,6 +137,10 @@ class ManualLabelRequest(BaseModel):
     product_id: str = Field(min_length=1, max_length=128)
 
 
+class ImageDeleteRequest(BaseModel):
+    object_names: list[str] = Field(min_length=1, max_length=MAX_BATCH_IMAGES)
+
+
 class PendingImageSelection(BaseModel):
     object_names: list[str] = Field(
         default_factory=list, max_length=MAX_SELECTED_IMAGES
@@ -680,6 +684,33 @@ def update_image_label(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/images")
+def delete_scale_images(
+    body: ImageDeleteRequest, access_token: SuperuserToken
+) -> dict[str, int]:
+    del access_token
+    storage = get_object_storage()
+    selected = list(dict.fromkeys(body.object_names))
+    try:
+        for object_name in selected:
+            require_source_image(object_name)
+        storage.delete_objects(
+            settings.S3_SCALE_BUCKET,
+            [
+                name
+                for object_name in selected
+                for name in (object_name, sidecar_object_name(object_name))
+            ],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not delete scale images"
+        ) from exc
+    return {"deleted": len(selected)}
 
 
 def _selected_pending_rows(
