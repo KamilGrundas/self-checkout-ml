@@ -75,6 +75,11 @@ class PageStorage:
     def get_bytes(self, bucket: str, object_name: str) -> bytes:
         return b"image-bytes"
 
+    def delete_objects(self, bucket: str, object_names: list[str]) -> None:
+        self.objects = [
+            item for item in self.objects if item.object_name not in object_names
+        ]
+
 
 def test_paginated_list_contains_only_scale_images(
     monkeypatch: pytest.MonkeyPatch,
@@ -158,6 +163,27 @@ def test_scale_image_content_is_returned_through_authenticated_api(
 
     assert response.body == b"image-bytes"
     assert response.media_type == "image/jpeg"
+
+
+def test_delete_scale_images_removes_sources_and_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = PageStorage()
+    monkeypatch.setattr(autolabel_scale, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(autolabel, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(autolabel_scale.settings, "S3_SCALE_BUCKET", "scale")
+
+    result = autolabel_scale.delete_scale_images(
+        autolabel_scale.ImageDeleteRequest(
+            object_names=["sessions/s1/captures/0001-product.jpg"]
+        ),
+        token(),
+    )
+
+    assert result == {"deleted": 1}
+    assert "sessions/s1/captures/0001-product.jpg" not in {
+        item.object_name for item in storage.objects
+    }
 
 
 def test_invalid_cursor_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

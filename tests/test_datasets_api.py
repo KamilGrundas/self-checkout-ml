@@ -76,6 +76,11 @@ class LabeledStorage:
             item.etag,
         )
 
+    def delete_objects(self, bucket: str, object_names: list[str]) -> None:
+        self.objects = [
+            item for item in self.objects if item.object_name not in object_names
+        ]
+
 
 def test_labeled_images_are_counted_and_filtered_by_final_label(
     monkeypatch: pytest.MonkeyPatch,
@@ -100,3 +105,22 @@ def test_labeled_images_are_counted_and_filtered_by_final_label(
         "labeled/apple-1.jpg",
         "labeled/apple-2.jpg",
     ]
+
+
+def test_delete_labeled_images_removes_selected_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = LabeledStorage()
+    monkeypatch.setattr(datasets, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(datasets.settings, "S3_EXTERNAL_BUCKET", "external")
+
+    result = asyncio.run(
+        datasets.delete_labeled_images(
+            datasets.ImageDeleteRequest(
+                object_names=["labeled/apple-1.jpg", "labeled/banana.jpg"]
+            )
+        )
+    )
+
+    assert result == {"deleted": 2}
+    assert [item.object_name for item in storage.objects] == ["labeled/apple-2.jpg"]

@@ -152,6 +152,48 @@ class ObjectStorageModelStore:
                 "cache_key": f"{self.model_name}:{version}",
             }
 
+    def delete_version(self, version: int) -> dict[str, Any]:
+        with self._lock:
+            metadata = self._read_json(self._metadata_object(version))
+            if metadata is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Version {version} not found for model {self.model_name}",
+                )
+
+            storage = get_object_storage()
+            active = self._read_json(self._active_object) or {}
+            is_active = active.get("version") == version
+            remaining = [
+                item for item in self.list_versions() if item.get("version") != version
+            ]
+            objects = [
+                item.object_name
+                for item in storage.list_objects(
+                    settings.S3_TRAINING_BUCKET,
+                    prefix=f"{self._versions_prefix}/{version}/",
+                )
+            ]
+            storage.delete_objects(settings.S3_TRAINING_BUCKET, objects)
+
+            if is_active:
+                if remaining:
+                    replacement = remaining[0]
+                    self._activate(int(replacement["version"]), replacement)
+                else:
+                    storage.delete_objects(
+                        settings.S3_TRAINING_BUCKET, [self._active_object]
+                    )
+                    self._cached_version = None
+                    self._cached_model = None
+                    self._cached_metadata = None
+
+            return {
+                "model_name": self.model_name,
+                "model_id": metadata["model_id"],
+                "deleted_objects": len(objects),
+            }
+
     def _load_active(self) -> tuple[Any, dict[str, Any]]:
         import joblib
 

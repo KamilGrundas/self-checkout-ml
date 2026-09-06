@@ -65,6 +65,16 @@ async def list_detect_models() -> list[ModelVersionPublic]:
     return [ModelVersionPublic(**v) for v in versions]
 
 
+@router.delete("/classify-models/{version}", dependencies=[SuperuserDep])
+async def delete_classify_model(version: int) -> dict:
+    return await run_in_threadpool(classifier_model_store.delete_version, version)
+
+
+@router.delete("/detect-models/{version}", dependencies=[SuperuserDep])
+async def delete_detect_model(version: int) -> dict:
+    return await run_in_threadpool(shelf_model_store.delete_version, version)
+
+
 @router.post(
     "/set-classify-model",
     response_model=ModelActivatedPublic,
