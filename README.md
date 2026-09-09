@@ -9,7 +9,8 @@ It has no Label Studio or MLflow dependency.
 The API runs with two Redis/RQ workers:
 
 - `classifier-training` trains product classifiers;
-- `scale-autolabel` calls the configured VLM sequentially for scale images.
+- `scale-autolabel` calls the configured vision inference provider sequentially
+  for scale images.
 
 All durable images, annotations, datasets, trained model artifacts, metrics,
 and active-model pointers use generic S3-compatible object storage. Provider
@@ -24,7 +25,7 @@ autolabel result is highlighted for review.
 
 Important endpoints:
 
-- `POST /api/v1/autolabel/scale/batches` starts VLM autolabeling;
+- `POST /api/v1/autolabel/scale/batches` starts vision-inference autolabeling;
 - `PATCH /api/v1/autolabel/scale/images/label` corrects a Label with an existing product;
 - `POST /api/v1/autolabel/scale/images/finalize` moves reviewed images to the labeled collection;
 - `POST /api/v1/datasets/scale-images` imports images without a known Label for review;

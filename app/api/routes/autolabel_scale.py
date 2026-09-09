@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
-import jwt
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
@@ -14,7 +13,7 @@ from redis.exceptions import RedisError
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
-from app.api.deps import SuperuserToken
+from app.api.deps import SuperuserDep, SuperuserToken
 from app.core.autolabel import (
     MAX_BATCH_IMAGES,
     MAX_OBJECT_NAME_LENGTH,
@@ -53,6 +52,7 @@ from app.core.object_storage import get_object_storage
 router = APIRouter(
     prefix="/autolabel/scale",
     tags=["scale-autolabel"],
+    dependencies=[SuperuserDep],
 )
 
 ItemStatus = Literal[
@@ -175,16 +175,9 @@ class FinalizeJobPublic(BaseModel):
 
 
 def _subject(access_token: str) -> str:
-    try:
-        payload = jwt.decode(
-            access_token,
-            settings.SECRET_KEY,
-            algorithms=["HS256"],
-        )
-        subject = str(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError) as exc:
-        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
-    return subject
+    from app.api.deps import backend_identity
+
+    return str(backend_identity(access_token)["id"])
 
 
 def _redis_text(value: bytes | str | None) -> str | None:

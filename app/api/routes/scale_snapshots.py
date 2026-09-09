@@ -2,7 +2,7 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from app.api.deps import SuperuserDep
+from app.api.deps import InvokeDep, SuperuserDep
 from app.core.config import settings
 from app.core.object_storage import (
     build_object_name,
@@ -16,7 +16,11 @@ from app.schemas import SessionSnapshotListPublic, SessionSnapshotPublic
 router = APIRouter(prefix="/checkout-sessions", tags=["scale-snapshots"])
 
 
-@router.post("/{session_id}/scale-snapshots", response_model=SessionSnapshotPublic)
+@router.post(
+    "/{session_id}/scale-snapshots",
+    response_model=SessionSnapshotPublic,
+    dependencies=[InvokeDep],
+)
 async def upload_scale_snapshot(
     session_id: str,
     capture_index: int = Form(..., ge=0),

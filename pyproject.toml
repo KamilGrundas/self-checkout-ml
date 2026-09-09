@@ -5,6 +5,7 @@ description = "ML snapshot storage API for self-checkout sessions"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi[standard]<1.0.0,>=0.114.2",
+    "cryptography>=46.0.0,<47.0.0",
     "httpx<1.0.0,>=0.28.0",
     "python-multipart<1.0.0,>=0.0.7",
     "pydantic>2.0",

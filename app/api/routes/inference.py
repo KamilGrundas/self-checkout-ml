@@ -1,7 +1,7 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import SuperuserDep
+from app.api.deps import InvokeDep, SuperuserDep
 from app.core.inference import classifier_model_store, shelf_model_store
 from app.schemas import (
     ModelActivatedPublic,
@@ -13,7 +13,7 @@ from app.schemas import (
 router = APIRouter(prefix="/inference", tags=["inference"])
 
 
-@router.post("/classify", response_model=PredictionPublic)
+@router.post("/classify", response_model=PredictionPublic, dependencies=[InvokeDep])
 async def classify_image(file: UploadFile = File(...)) -> PredictionPublic:
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid image file")

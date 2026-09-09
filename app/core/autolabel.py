@@ -15,6 +15,7 @@ import httpx
 from botocore.exceptions import ClientError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.core.autolabel_credentials import inference_headers
 from app.core.config import settings
 from app.core.object_storage import S3ObjectMetadata, get_object_storage
 
@@ -28,6 +29,8 @@ SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 class AutolabelConfiguration(BaseModel):
+    model_name: str = ""
+    api_key_encrypted: str | None = Field(default=None, repr=False)
     endpoint_url: str | None
     max_tokens: int = Field(ge=1, le=4096)
     connect_timeout_seconds: int = Field(ge=1, le=30)
@@ -48,7 +51,7 @@ class CandidateResponse(BaseModel):
 
 
 class InferenceResponseEnvelope(BaseModel):
-    """Response schema observed from the configured local VLM endpoint."""
+    """Response schema observed from the configured vision inference provider."""
 
     model_config = ConfigDict(extra="forbid")
     id: str
@@ -104,12 +107,13 @@ def _backend_headers(access_token: str) -> dict[str, str]:
 
 
 def load_configuration(access_token: str) -> AutolabelConfiguration:
-    url = f"{settings.BACKEND_URL.rstrip('/')}/api/v1/system-settings/autolabel"
+    url = f"{settings.BACKEND_URL.rstrip('/')}/api/v1/system-settings/autolabel/runtime"
     try:
         response = httpx.get(
             url,
             headers=_backend_headers(access_token),
             follow_redirects=False,
+            trust_env=False,
             timeout=httpx.Timeout(10.0, connect=3.0),
         )
         response.raise_for_status()
@@ -133,6 +137,7 @@ def load_catalog(access_token: str) -> list[CatalogCandidate]:
                 params={"skip": skip, "limit": limit},
                 headers=_backend_headers(access_token),
                 follow_redirects=False,
+                trust_env=False,
                 timeout=httpx.Timeout(10.0, connect=3.0),
             )
             response.raise_for_status()
@@ -270,12 +275,23 @@ def parse_inference_response(body: bytes, allowed_keys: set[str]) -> InferenceRe
         candidate_payload = decoded
     else:
         try:
-            envelope = InferenceResponseEnvelope.model_validate(decoded)
+            if isinstance(decoded, dict) and "choices" in decoded:
+                choice = decoded["choices"][0]
+                if choice.get("finish_reason") != "stop":
+                    raise InferenceParseError("Model response is incomplete")
+                response_text = choice["message"]["content"]
+                if not isinstance(response_text, str):
+                    raise InferenceParseError("Model response has no text content")
+            else:
+                envelope = InferenceResponseEnvelope.model_validate(decoded)
+                response_text = envelope.response
+        except (KeyError, IndexError, TypeError) as exc:
+            raise InferenceParseError("Invalid chat completion response") from exc
         except ValidationError as exc:
             raise InferenceParseError(
                 "Inference response envelope is not supported"
             ) from exc
-        response_text = envelope.response.strip()
+        response_text = response_text.strip()
         fenced = re.fullmatch(
             r"```(?:json)?\s*(\{.*\})\s*```",
             response_text,
@@ -335,23 +351,65 @@ def call_inference(
         write=30.0,
         pool=5.0,
     )
+    try:
+        headers = inference_headers(
+            configuration.api_key_encrypted, configuration.endpoint_url
+        )
+    except ValueError as exc:
+        raise InferenceRequestError(str(exc)) from exc
     response: httpx.Response | None = None
     for attempt in range(2):
         try:
-            with httpx.Client(follow_redirects=False, timeout=timeout) as client:
+            with httpx.Client(
+                follow_redirects=False, timeout=timeout, trust_env=False
+            ) as client:
                 with client.stream(
                     "POST",
                     configuration.endpoint_url,
-                    data={
-                        "prompt": prompt,
-                        "max_tokens": str(configuration.max_tokens),
-                    },
-                    files={
-                        "image": (
-                            PurePosixPath(object_name).name,
-                            image_bytes,
-                            content_type,
-                        )
+                    headers=headers,
+                    json={
+                        "model": configuration.model_name,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{content_type};base64,{base64.b64encode(image_bytes).decode()}"
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                        "max_tokens": configuration.max_tokens,
+                        "temperature": 0,
+                        "stream": False,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "product_candidate",
+                                "strict": True,
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "candidate_key": {
+                                            "anyOf": [
+                                                {
+                                                    "type": "string",
+                                                    "enum": sorted(allowed_keys),
+                                                },
+                                                {"type": "null"},
+                                            ]
+                                        }
+                                    },
+                                    "required": ["candidate_key"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
                     },
                 ) as streamed:
                     chunks: list[bytes] = []

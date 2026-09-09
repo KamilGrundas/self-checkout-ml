@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,8 @@ ORIGINAL_HTTPX_CLIENT = httpx.Client
 
 def configuration(**updates: Any) -> AutolabelConfiguration:
     values = {
-        "endpoint_url": "http://vlm.test/v1/files/inference",
+        "endpoint_url": "https://vlm.test/v1/chat/completions",
+        "model_name": "vision-model",
         "max_tokens": 512,
         "connect_timeout_seconds": 5,
         "read_timeout_seconds": 120,
@@ -109,7 +112,7 @@ def _install_transport(
     monkeypatch.setattr(autolabel.httpx, "Client", safe_factory)
 
 
-def test_inference_sends_exact_multipart_fields(
+def test_inference_sends_chat_completion_with_image_and_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -134,15 +137,24 @@ def test_inference_sends_exact_multipart_fields(
         allowed_keys={"P0001"},
     )
 
-    body = captured["body"]
-    assert captured["content_type"].startswith("multipart/form-data; boundary=")
-    assert b'name="prompt"' in body
-    assert b"test prompt" in body
-    assert b'name="max_tokens"' in body
-    assert b"512" in body
-    assert b'name="image"; filename="0001-product.jpg"' in body
-    assert b"Content-Type: image/jpeg" in body
-    assert b"real-image-bytes" in body
+    body = json.loads(captured["body"])
+    assert captured["content_type"] == "application/json"
+    assert body["model"] == "vision-model"
+    assert body["messages"][0]["content"] == [
+        {"type": "text", "text": "test prompt"},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/jpeg;base64,"
+                + base64.b64encode(b"real-image-bytes").decode()
+            },
+        },
+    ]
+    assert body["max_tokens"] == 512
+    assert body["stream"] is False
+    assert body["response_format"]["json_schema"]["schema"]["properties"][
+        "candidate_key"
+    ]["anyOf"][0]["enum"] == ["P0001"]
     assert result.candidate_key == "P0001"
 
 
@@ -448,3 +460,84 @@ def test_finalize_worker_moves_only_matched_images(
     assert result == {"moved": 1}
     assert storage.copied == ["raw/scale/matched.jpg"]
     assert "raw/scale/matched.jpg" in storage.deleted
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", None])
+def test_chat_completion_rejects_incomplete_output(finish_reason):
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": finish_reason,
+                    "message": {"content": '{"candidate_key":"P0001"}'},
+                }
+            ]
+        }
+    ).encode()
+    with pytest.raises(InferenceParseError):
+        autolabel.parse_inference_response(body, {"P0001"})
+
+
+def test_chat_completion_parses_content_not_reasoning():
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"candidate_key":"P0001"}',
+                        "reasoning_content": "private reasoning",
+                    },
+                }
+            ]
+        }
+    ).encode()
+    result = autolabel.parse_inference_response(body, {"P0001"})
+    assert result.candidate_key == "P0001"
+    assert "reasoning" not in result.response_preview
+
+
+def test_encrypted_token_is_bound_to_endpoint_and_sent_as_bearer(monkeypatch):
+    import hashlib
+    import hmac
+    from cryptography.fernet import Fernet
+    from app.core import autolabel_credentials
+
+    monkeypatch.setattr(autolabel_credentials.settings, "SECRET_KEY", "test-only-key")
+    key = base64.urlsafe_b64encode(
+        hmac.digest(b"test-only-key", b"autolabel-credentials-v1", hashlib.sha256)
+    )
+    endpoint = "https://vlm.test/v1/chat/completions"
+    encrypted = (
+        Fernet(key)
+        .encrypt(
+            json.dumps(
+                {"endpoint_url": endpoint, "api_key": "test-only-token"}
+            ).encode()
+        )
+        .decode()
+    )
+
+    def handler(request):
+        assert request.headers["Authorization"] == "Bearer test-only-token"
+        return httpx.Response(200, json={"candidate_key": None})
+
+    _install_transport(monkeypatch, handler)
+    cfg = configuration(api_key_encrypted=encrypted)
+    assert "test-only-token" not in json.dumps(cfg.model_dump())
+    autolabel.call_inference(
+        configuration=cfg,
+        object_name="x.jpg",
+        content_type="image/jpeg",
+        image_bytes=b"image",
+        prompt="test",
+        allowed_keys={"P0001"},
+    )
+    for wrong in [
+        "https://other.test/v1/chat/completions",
+        "http://vlm.test/v1/chat/completions",
+    ]:
+        with pytest.raises(ValueError):
+            autolabel_credentials.inference_headers(encrypted, wrong)
+    with pytest.raises(ValueError, match="invalid"):
+        autolabel_credentials.inference_headers("corrupt", endpoint)

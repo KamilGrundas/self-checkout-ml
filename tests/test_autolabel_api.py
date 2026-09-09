@@ -17,6 +17,15 @@ from app.core.autolabel import (
 from app.core.object_storage import S3Object, S3ObjectMetadata
 
 
+@pytest.fixture(autouse=True)
+def authenticated_backend(monkeypatch):
+    # Route tests use a stubbed authenticated backend; dependency auth has separate tests.
+    monkeypatch.setattr(
+        "app.api.deps.backend_identity",
+        lambda _: {"id": "user-1", "is_superuser": True},
+    )
+
+
 def token() -> str:
     autolabel_scale.settings.SECRET_KEY = "unit-test-secret-at-least-32-bytes"
     return jwt.encode(
