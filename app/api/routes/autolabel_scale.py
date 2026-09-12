@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from redis.exceptions import RedisError
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
@@ -17,9 +17,12 @@ from app.api.deps import SuperuserDep, SuperuserToken
 from app.core.autolabel import (
     MAX_BATCH_IMAGES,
     MAX_OBJECT_NAME_LENGTH,
+    AutolabelConfiguration,
     AutolabelSidecar,
     build_prompt,
     call_inference,
+    cancel_provider_inference,
+    configure_provider_cancellation,
     decode_cursor,
     encode_cursor,
     is_supported_image,
@@ -62,6 +65,7 @@ ItemStatus = Literal[
     "matched",
     "unmatched",
     "failed",
+    "cancelled",
 ]
 
 
@@ -109,14 +113,49 @@ class AutolabelBatchItem(BaseModel):
     error: str | None = None
 
 
+class ActiveAutolabelItems(dict[str, AutolabelBatchItem]):
+    """Expose detailed items, or synthesize bulk processing states on lookup."""
+
+    def __init__(
+        self,
+        items: list[AutolabelBatchItem],
+        *,
+        object_names: set[str] | None = None,
+        completed_object_names: set[str] | None = None,
+        status: ItemStatus | None = None,
+    ) -> None:
+        super().__init__((item.object_name, item) for item in items)
+        self.object_names = object_names or set()
+        self.completed_object_names = completed_object_names or set()
+        self.status = status
+
+    def get(
+        self, object_name: str, default: AutolabelBatchItem | None = None
+    ) -> AutolabelBatchItem | None:
+        item = super().get(object_name)
+        if item is not None:
+            return item
+        if (
+            self.status is not None
+            and object_name in self.object_names
+            and object_name not in self.completed_object_names
+        ):
+            return AutolabelBatchItem(object_name=object_name, status=self.status)
+        return default
+
+
 class AutolabelBatchPublic(BaseModel):
     batch_id: str
-    status: Literal["queued", "processing", "completed", "failed"]
+    status: Literal["queued", "processing", "completed", "failed", "cancelled"]
     total: int
     completed: int
     matched: int
     unmatched: int
     failed: int
+    cancelled: int
+    provider_cancellation: Literal[
+        "available", "not_supported", "unavailable", "requested", "not_requested"
+    ]
     items: list[AutolabelBatchItem]
 
 
@@ -189,20 +228,32 @@ def _redis_text(value: bytes | str | None) -> str | None:
 def _serialize_job(job: Job) -> AutolabelBatchPublic:
     rq_status = job.get_status(refresh=True)
     meta = job.meta or {}
-    if rq_status in {"failed", "stopped", "canceled"}:
+    if rq_status in {"failed", "stopped"}:
         public_status = "failed"
     else:
         public_status = str(meta.get("status") or "queued")
-    if public_status not in {"queued", "processing", "completed", "failed"}:
+    if rq_status == "canceled" or meta.get("cancel_requested"):
+        public_status = "cancelled"
+    if public_status not in {
+        "queued",
+        "processing",
+        "completed",
+        "failed",
+        "cancelled",
+    }:
         public_status = "queued"
     items = [
         AutolabelBatchItem.model_validate(item) for item in (meta.get("items") or [])
     ]
-    if public_status == "failed":
+    if public_status in {"failed", "cancelled"}:
         for item in items:
             if item.status in {"queued", "processing"}:
-                item.status = "failed"
-                item.error = "Autolabel worker stopped before completing the item"
+                item.status = public_status
+                item.error = (
+                    "Autolabeling was cancelled"
+                    if public_status == "cancelled"
+                    else "Autolabel worker stopped before completing the item"
+                )
     return AutolabelBatchPublic(
         batch_id=job.id,
         status=public_status,  # type: ignore[arg-type]
@@ -211,6 +262,8 @@ def _serialize_job(job: Job) -> AutolabelBatchPublic:
         matched=int(meta.get("matched") or 0),
         unmatched=int(meta.get("unmatched") or 0),
         failed=int(meta.get("failed") or 0),
+        cancelled=int(meta.get("cancelled") or 0),
+        provider_cancellation=str(meta.get("provider_cancellation") or "not_supported"),  # type: ignore[arg-type]
         items=items,
     )
 
@@ -230,9 +283,25 @@ def _latest_batch(access_token: str) -> AutolabelBatchPublic | None:
 
 def _active_items(access_token: str) -> dict[str, AutolabelBatchItem]:
     batch = _latest_batch(access_token)
-    if not batch or batch.status not in {"queued", "processing"}:
+    if not batch or batch.status not in {"queued", "processing", "cancelled"}:
         return {}
-    return {item.object_name: item for item in batch.items}
+    if batch.items:
+        return ActiveAutolabelItems(batch.items)
+    try:
+        job = Job.fetch(batch.batch_id, connection=get_autolabel_queue().connection)
+        body = job.args[0]
+        object_names = {str(name) for name in body["object_names"]}
+        completed_object_names = {
+            str(name) for name in (job.meta or {}).get("completed_object_names") or []
+        }
+    except (IndexError, KeyError, TypeError, NoSuchJobError, RedisError):
+        return {}
+    return ActiveAutolabelItems(
+        [],
+        object_names=object_names,
+        completed_object_names=completed_object_names,
+        status=batch.status,
+    )
 
 
 def _parse_session_fields(object_name: str) -> tuple[str | None, int | None]:
@@ -482,6 +551,7 @@ def create_batch(
         raise HTTPException(status_code=422, detail="No images matched the selection")
     if body.selection == "explicit" and len(object_names) != len(body.object_names):
         body = body.model_copy(update={"object_names": object_names})
+    batch_id = str(uuid4())
     try:
         configuration = load_configuration(access_token)
         catalog = load_catalog(access_token)
@@ -489,6 +559,9 @@ def create_batch(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    configuration, provider_cancellation = configure_provider_cancellation(
+        configuration, batch_id
+    )
     for object_name in object_names if body.selection == "explicit" else []:
         try:
             metadata = require_source_image(object_name)
@@ -503,7 +576,6 @@ def create_batch(
 
     subject = _subject(access_token)
     digest = request_digest(object_names)
-    batch_id = str(uuid4())
     redis = get_redis()
     idempotency_redis_key = f"autolabel:idempotency:{subject}:{idempotency_key}"
     reservation = json.dumps({"digest": digest, "batch_id": batch_id})
@@ -543,6 +615,7 @@ def create_batch(
             meta=initial_job_meta(
                 object_names,
                 include_items=body.selection == "explicit",
+                provider_cancellation=provider_cancellation,
             ),
             description=f"Autolabel {len(object_names)} scale images",
         )
@@ -579,6 +652,50 @@ def batch_status(
     if latest is None or latest.batch_id != batch_id:
         raise HTTPException(status_code=404, detail="Autolabel batch not found")
     return latest
+
+
+@router.post("/batches/{batch_id}/cancel", response_model=AutolabelBatchPublic)
+def cancel_batch(batch_id: str, access_token: SuperuserToken) -> AutolabelBatchPublic:
+    latest = _latest_batch(access_token)
+    if latest is None or latest.batch_id != batch_id:
+        raise HTTPException(status_code=404, detail="Autolabel batch not found")
+    if latest.status not in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Autolabel batch is not running")
+    try:
+        job = Job.fetch(batch_id, connection=get_autolabel_queue().connection)
+        meta = dict(job.meta or {})
+        try:
+            body = job.args[0]
+            configuration = AutolabelConfiguration.model_validate(body["configuration"])
+            provider_cancellation = cancel_provider_inference(configuration)
+        except (IndexError, KeyError, TypeError, ValidationError):
+            provider_cancellation = "unavailable"
+        cancelled = 0
+        for item in meta.get("items") or []:
+            if item.get("status") in {"queued", "processing"}:
+                item.update(
+                    status="cancelled",
+                    product_id=None,
+                    product_name=None,
+                    error="Autolabeling was cancelled",
+                )
+                cancelled += 1
+        meta.update(
+            status="cancelled",
+            cancel_requested=True,
+            completed=int(meta.get("total") or len(meta.get("items") or [])),
+            cancelled=cancelled,
+            provider_cancellation=provider_cancellation,
+            items=meta.get("items") or [],
+        )
+        job.cancel()
+        job.meta = meta
+        job.save_meta()
+        return _serialize_job(job)
+    except (NoSuchJobError, RedisError) as exc:
+        raise HTTPException(
+            status_code=503, detail="Autolabel queue is unavailable"
+        ) from exc
 
 
 @router.post("/test", response_model=AutolabelTestResult)

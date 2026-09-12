@@ -36,7 +36,10 @@ def request_digest(object_names: list[str]) -> str:
 
 
 def initial_job_meta(
-    object_names: list[str], *, include_items: bool = True
+    object_names: list[str],
+    *,
+    include_items: bool = True,
+    provider_cancellation: str = "not_supported",
 ) -> dict[str, Any]:
     return {
         "status": "queued",
@@ -45,6 +48,12 @@ def initial_job_meta(
         "matched": 0,
         "unmatched": 0,
         "failed": 0,
+        "cancelled": 0,
+        "provider_cancellation": provider_cancellation,
+        # Bulk batches intentionally omit items from the public response. Keep
+        # just completed object names internally so the image list can mark
+        # the remaining selection as processing.
+        "completed_object_names": [],
         "items": [
             {
                 "object_name": object_name,

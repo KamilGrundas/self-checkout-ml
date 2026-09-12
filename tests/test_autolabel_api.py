@@ -243,6 +243,18 @@ class FakeRedis:
         self.values.pop(key, None)
 
 
+def test_bulk_active_items_show_processing_until_their_result_is_saved() -> None:
+    active_items = autolabel_scale.ActiveAutolabelItems(
+        [],
+        object_names={"one.jpg", "two.jpg"},
+        completed_object_names={"one.jpg"},
+        status="processing",
+    )
+
+    assert active_items.get("one.jpg") is None
+    assert active_items.get("two.jpg").status == "processing"  # type: ignore[union-attr]
+
+
 def test_batch_enqueue_deduplicates_objects_and_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

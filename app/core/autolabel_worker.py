@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from pydantic import ValidationError
@@ -38,6 +39,7 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
     job = get_current_job()
     meta = dict(job.meta) if job is not None else {}
     items = list(meta.get("items") or [])
+    completed_object_names = list(meta.get("completed_object_names") or [])
     detailed_items = len(items) == len(body["object_names"])
     configuration = AutolabelConfiguration.model_validate(body["configuration"])
     catalog = [CatalogCandidate.model_validate(item) for item in body["catalog"]]
@@ -45,47 +47,69 @@ def run_autolabel_batch(body: dict[str, Any]) -> dict[str, Any]:
     meta["status"] = "processing"
     _save_meta(meta)
 
-    for index, object_name in enumerate(body["object_names"]):
-        item = items[index] if detailed_items else None
-        if item is not None:
+    object_names = body["object_names"]
+    if detailed_items:
+        for item in items:
             item["status"] = "processing"
-            meta["items"] = items
-            _save_meta(meta)
-        try:
-            sidecar = process_image(
-                object_name=object_name,
-                batch_id=batch_id,
-                configuration=configuration,
-                catalog=catalog,
-            )
-            if item is not None:
-                item.update(
-                    status=sidecar.state,
-                    product_id=sidecar.product_id,
-                    product_name=sidecar.product_name,
-                    error=None,
-                )
-            meta[sidecar.state] = int(meta.get(sidecar.state) or 0) + 1
-        except Exception as exc:
-            error = _safe_error(exc)
-            write_failed_sidecar(
-                object_name=object_name,
-                batch_id=batch_id,
-                configuration=configuration,
-                error=error,
-            )
-            if item is not None:
-                item.update(
-                    status="failed",
-                    product_id=None,
-                    product_name=None,
-                    error=error,
-                )
-            meta["failed"] = int(meta.get("failed") or 0) + 1
-        meta["completed"] = index + 1
         meta["items"] = items
         _save_meta(meta)
 
+    def process(object_name: str):
+        return process_image(
+            object_name=object_name,
+            batch_id=batch_id,
+            configuration=configuration,
+            catalog=catalog,
+        )
+
+    with ThreadPoolExecutor(max_workers=max(1, len(object_names))) as executor:
+        futures = {
+            executor.submit(process, object_name): (index, object_name)
+            for index, object_name in enumerate(object_names)
+        }
+        for future in as_completed(futures):
+            if job is not None:
+                job.refresh()
+                if job.meta.get("cancel_requested"):
+                    continue
+            index, object_name = futures[future]
+            item = items[index] if detailed_items else None
+            try:
+                sidecar = future.result()
+                if item is not None:
+                    item.update(
+                        status=sidecar.state,
+                        product_id=sidecar.product_id,
+                        product_name=sidecar.product_name,
+                        error=None,
+                    )
+                meta[sidecar.state] = int(meta.get(sidecar.state) or 0) + 1
+            except Exception as exc:
+                error = _safe_error(exc)
+                write_failed_sidecar(
+                    object_name=object_name,
+                    batch_id=batch_id,
+                    configuration=configuration,
+                    error=error,
+                )
+                if item is not None:
+                    item.update(
+                        status="failed",
+                        product_id=None,
+                        product_name=None,
+                        error=error,
+                    )
+                meta["failed"] = int(meta.get("failed") or 0) + 1
+            meta["completed"] = int(meta.get("completed") or 0) + 1
+            completed_object_names.append(object_name)
+            meta["completed_object_names"] = completed_object_names
+            meta["items"] = items
+            _save_meta(meta)
+
+    if job is not None:
+        job.refresh()
+        if job.meta.get("cancel_requested"):
+            return dict(job.meta)
     meta["status"] = "completed"
     _save_meta(meta)
     return meta

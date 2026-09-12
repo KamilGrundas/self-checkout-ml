@@ -9,8 +9,9 @@ It has no Label Studio or MLflow dependency.
 The API runs with two Redis/RQ workers:
 
 - `classifier-training` trains product classifiers;
-- `scale-autolabel` calls the configured vision inference provider sequentially
-  for scale images.
+- `scale-autolabel` submits every image in an autolabel batch concurrently to
+  the configured vision inference provider. The provider is responsible for
+  scheduling those requests.
 
 All durable images, annotations, datasets, trained model artifacts, metrics,
 and active-model pointers use generic S3-compatible object storage. Provider

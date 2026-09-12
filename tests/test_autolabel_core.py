@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -152,10 +153,84 @@ def test_inference_sends_chat_completion_with_image_and_schema(
     ]
     assert body["max_tokens"] == 512
     assert body["stream"] is False
+    assert "session_id" not in body
     assert body["response_format"]["json_schema"]["schema"]["properties"][
         "candidate_key"
     ]["anyOf"][0]["enum"] == ["P0001"]
     assert result.candidate_key == "P0001"
+
+
+def test_unsloth_cancellation_is_discovered_and_scoped_to_the_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openapi = {
+        "paths": {"/api/inference/cancel": {"post": {}}},
+        "components": {
+            "schemas": {"ChatCompletionRequest": {"properties": {"session_id": {}}}}
+        },
+    }
+    monkeypatch.setattr(
+        autolabel.httpx,
+        "get",
+        lambda *args, **kwargs: httpx.Response(200, json=openapi),
+    )
+    configured, status = autolabel.configure_provider_cancellation(
+        configuration(), "batch-123"
+    )
+
+    assert status == "available"
+    assert (
+        configured.provider_cancel_endpoint_url
+        == "https://vlm.test/api/inference/cancel"
+    )
+    assert configured.provider_cancel_session_id == "self-checkout-autolabel-batch-123"
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.read()))
+        return httpx.Response(200, json={"candidate_key": None})
+
+    _install_transport(monkeypatch, handler)
+    autolabel.call_inference(
+        configuration=configured,
+        object_name="image.jpg",
+        content_type="image/jpeg",
+        image_bytes=b"image",
+        prompt="test",
+        allowed_keys={"P0001"},
+    )
+
+    assert captured["session_id"] == "self-checkout-autolabel-batch-123"
+
+
+def test_provider_cancellation_posts_only_the_batch_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def post(url: str, **kwargs: Any) -> httpx.Response:
+        captured["url"] = url
+        captured["json"] = kwargs["json"]
+        return httpx.Response(200, json={"cancelled": 4})
+
+    monkeypatch.setattr(autolabel.httpx, "post", post)
+    status = autolabel.cancel_provider_inference(
+        configuration(
+            provider_cancel_endpoint_url="https://vlm.test/api/inference/cancel",
+            provider_cancel_session_id="self-checkout-autolabel-batch-123",
+        )
+    )
+
+    assert status == "requested"
+    assert captured == {
+        "url": "https://vlm.test/api/inference/cancel",
+        "json": {"session_id": "self-checkout-autolabel-batch-123"},
+    }
+
+
+def test_provider_cancellation_is_not_used_without_discovery() -> None:
+    assert autolabel.cancel_provider_inference(configuration()) == "not_supported"
 
 
 @pytest.mark.parametrize("status_code", [400, 500])
@@ -337,6 +412,9 @@ class FakeJob:
     def save_meta(self) -> None:
         self.saved += 1
 
+    def refresh(self) -> None:
+        pass
+
 
 def test_worker_continues_after_single_image_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -349,10 +427,12 @@ def test_worker_continues_after_single_image_failure(
         lambda **kwargs: None,
     )
     processed: list[str] = []
+    barrier = threading.Barrier(2)
 
     def process(**kwargs):
         object_name = kwargs["object_name"]
         processed.append(object_name)
+        barrier.wait(timeout=1)
         if object_name == "one.jpg":
             raise RuntimeError("first failed")
         return AutolabelSidecar(
@@ -379,7 +459,7 @@ def test_worker_continues_after_single_image_failure(
         }
     )
 
-    assert processed == ["one.jpg", "two.jpg"]
+    assert set(processed) == {"one.jpg", "two.jpg"}
     assert result["status"] == "completed"
     assert result["failed"] == 1
     assert result["unmatched"] == 1
@@ -390,6 +470,7 @@ def test_worker_continues_after_single_image_failure(
         items=[], total=2, completed=0, matched=0, unmatched=0, failed=0
     )
     processed.clear()
+    barrier = threading.Barrier(2)
     monkeypatch.setattr(autolabel_worker, "get_current_job", lambda: bulk_job)
 
     bulk_result = autolabel_worker.run_autolabel_batch(

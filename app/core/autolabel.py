@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any, Literal
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 from botocore.exceptions import ClientError
@@ -23,6 +23,7 @@ SIDECAR_PREFIX = "_autolabel/scale/v1/"
 SIDECAR_SCHEMA_VERSION = 1
 PROMPT_VERSION = "scale-candidates-v1"
 MAX_RESPONSE_BYTES = 1_048_576
+MAX_PROVIDER_CAPABILITY_BYTES = 1_048_576
 MAX_BATCH_IMAGES = 100
 MAX_OBJECT_NAME_LENGTH = 1024
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -34,8 +35,17 @@ class AutolabelConfiguration(BaseModel):
     endpoint_url: str | None
     max_tokens: int = Field(ge=1, le=4096)
     connect_timeout_seconds: int = Field(ge=1, le=30)
-    read_timeout_seconds: int = Field(ge=1, le=600)
+    read_timeout_seconds: int = Field(ge=1, le=6000)
     configured: bool
+    # Optional extension negotiated per batch.  Unsloth exposes this through
+    # /api/inference/cancel; other OpenAI-compatible providers need not.
+    provider_cancel_endpoint_url: str | None = None
+    provider_cancel_session_id: str | None = None
+
+
+ProviderCancellationStatus = Literal[
+    "available", "not_supported", "unavailable", "requested", "not_requested"
+]
 
 
 class CatalogCandidate(BaseModel):
@@ -123,6 +133,91 @@ def load_configuration(access_token: str) -> AutolabelConfiguration:
     if not configuration.configured or not configuration.endpoint_url:
         raise ValueError("Autolabel inference endpoint is not configured")
     return configuration
+
+
+def configure_provider_cancellation(
+    configuration: AutolabelConfiguration, batch_id: str
+) -> tuple[AutolabelConfiguration, ProviderCancellationStatus]:
+    """Discover the optional per-provider cancellation extension.
+
+    The OpenAI-compatible contract does not define cancellation.  Unsloth
+    documents both ``session_id`` on chat completions and
+    ``/api/inference/cancel`` in its OpenAPI document.  Keeping this discovery
+    opt-in means a different provider receives only the standard request.
+    """
+    assert configuration.endpoint_url is not None
+    parsed = urlsplit(configuration.endpoint_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return configuration, "not_supported"
+    origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    try:
+        headers = inference_headers(
+            configuration.api_key_encrypted, configuration.endpoint_url
+        )
+        response = httpx.get(
+            f"{origin}/openapi.json",
+            headers=headers,
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(5.0, connect=3.0),
+        )
+    except (httpx.HTTPError, ValueError):
+        return configuration, "unavailable"
+    if response.status_code in {404, 405, 501}:
+        return configuration, "not_supported"
+    if response.is_error or response.is_redirect:
+        return configuration, "unavailable"
+    if len(response.content) > MAX_PROVIDER_CAPABILITY_BYTES:
+        return configuration, "not_supported"
+    try:
+        document = response.json()
+        cancel_operation = document["paths"]["/api/inference/cancel"]["post"]
+        chat_schema = document["components"]["schemas"]["ChatCompletionRequest"]
+        session_id = chat_schema["properties"]["session_id"]
+    except (KeyError, TypeError, ValueError):
+        return configuration, "not_supported"
+    if not isinstance(cancel_operation, dict) or not isinstance(session_id, dict):
+        return configuration, "not_supported"
+    return (
+        configuration.model_copy(
+            update={
+                "provider_cancel_endpoint_url": f"{origin}/api/inference/cancel",
+                "provider_cancel_session_id": f"self-checkout-autolabel-{batch_id}",
+            }
+        ),
+        "available",
+    )
+
+
+def cancel_provider_inference(
+    configuration: AutolabelConfiguration,
+) -> ProviderCancellationStatus:
+    """Ask a negotiated provider to cancel this batch's in-flight requests."""
+    if (
+        not configuration.provider_cancel_endpoint_url
+        or not configuration.provider_cancel_session_id
+        or not configuration.endpoint_url
+    ):
+        return "not_supported"
+    try:
+        headers = inference_headers(
+            configuration.api_key_encrypted, configuration.endpoint_url
+        )
+        response = httpx.post(
+            configuration.provider_cancel_endpoint_url,
+            headers=headers,
+            json={"session_id": configuration.provider_cancel_session_id},
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(5.0, connect=3.0),
+        )
+    except (httpx.HTTPError, ValueError):
+        return "unavailable"
+    if response.status_code in {404, 405, 501}:
+        return "not_supported"
+    if response.is_error or response.is_redirect:
+        return "unavailable"
+    return "requested"
 
 
 def load_catalog(access_token: str) -> list[CatalogCandidate]:
@@ -357,6 +452,50 @@ def call_inference(
         )
     except ValueError as exc:
         raise InferenceRequestError(str(exc)) from exc
+    payload: dict[str, Any] = {
+        "model": configuration.model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{content_type};base64,{base64.b64encode(image_bytes).decode()}"
+                        },
+                    },
+                ],
+            }
+        ],
+        "max_tokens": configuration.max_tokens,
+        "temperature": 0,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "product_candidate",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_key": {
+                            "anyOf": [
+                                {"type": "string", "enum": sorted(allowed_keys)},
+                                {"type": "null"},
+                            ]
+                        }
+                    },
+                    "required": ["candidate_key"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    if configuration.provider_cancel_session_id:
+        payload["session_id"] = configuration.provider_cancel_session_id
+
     response: httpx.Response | None = None
     for attempt in range(2):
         try:
@@ -367,50 +506,7 @@ def call_inference(
                     "POST",
                     configuration.endpoint_url,
                     headers=headers,
-                    json={
-                        "model": configuration.model_name,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:{content_type};base64,{base64.b64encode(image_bytes).decode()}"
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-                        "max_tokens": configuration.max_tokens,
-                        "temperature": 0,
-                        "stream": False,
-                        "chat_template_kwargs": {"enable_thinking": False},
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "product_candidate",
-                                "strict": True,
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "candidate_key": {
-                                            "anyOf": [
-                                                {
-                                                    "type": "string",
-                                                    "enum": sorted(allowed_keys),
-                                                },
-                                                {"type": "null"},
-                                            ]
-                                        }
-                                    },
-                                    "required": ["candidate_key"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                        },
-                    },
+                    json=payload,
                 ) as streamed:
                     chunks: list[bytes] = []
                     total = 0
