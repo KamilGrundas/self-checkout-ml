@@ -61,6 +61,10 @@ path-style addressing, timeout, retry, and bucket-creation settings are shared
 with the rest of the project. Never commit `.env`, datasets, snapshots, model
 artifacts, or credentials.
 
+Checkout snapshot uploads require the counter API key in `X-API-Key`. The ML
+service asks the backend to verify both the key and that the target checkout
+session belongs to the key's bound counter. Classification uses the same key.
+
 ## Validation
 
 ```bash

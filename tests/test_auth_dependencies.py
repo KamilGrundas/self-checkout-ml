@@ -50,6 +50,25 @@ def test_unavailable_backend_fails_closed(monkeypatch):
     assert error.value.status_code == 503
 
 
+def test_snapshot_upload_requires_a_counter_key_bound_to_its_session(monkeypatch):
+    real_client = httpx.Client
+
+    def handle(request):
+        assert request.url.path.endswith("/login/checkout-key/check")
+        assert request.url.params["scope"] == "ml:invoke"
+        assert request.url.params["checkout_session_id"] == "session-1"
+        assert request.headers["X-API-Key"] == "sck_counter"
+        return httpx.Response(200, json={"counter_id": "counter-1"})
+
+    monkeypatch.setattr(
+        deps.httpx,
+        "Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw),
+    )
+    request = Request({"type": "http", "headers": [(b"x-api-key", b"sck_counter")]})
+    deps.require_checkout_snapshot_invoke("session-1", request)
+
+
 @pytest.mark.parametrize("is_admin,status", [(False, 403), (True, None)])
 def test_human_invoke_requires_admin(monkeypatch, is_admin, status):
     mock_backend(monkeypatch, 200, {"id": "user-id", "is_superuser": is_admin})
@@ -88,7 +107,11 @@ def test_all_ml_routes_reject_catalog_reader(monkeypatch):
                     json={},
                 )
                 checked += 1
-                assert response.status_code == 403, (method, path, response.status_code)
+                assert response.status_code in (401, 403), (
+                    method,
+                    path,
+                    response.status_code,
+                )
 
     assert checked >= 30
 

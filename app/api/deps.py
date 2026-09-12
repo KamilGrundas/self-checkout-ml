@@ -71,6 +71,32 @@ def require_invoke(request: Request) -> None:
     get_current_superuser(token)
 
 
+def require_checkout_snapshot_invoke(session_id: str, request: Request) -> None:
+    api_key = request.headers.get("X-API-Key")
+    authorization = request.headers.get("Authorization", "")
+    if api_key and authorization:
+        raise HTTPException(400, "Use one authentication method per request")
+    if not api_key:
+        raise HTTPException(401, "Checkout counter API key required")
+    try:
+        with httpx.Client(
+            timeout=10, trust_env=False, follow_redirects=False
+        ) as client:
+            response = client.post(
+                f"{settings.BACKEND_URL.rstrip('/')}/api/v1/login/checkout-key/check",
+                params={"scope": "ml:invoke", "checkout_session_id": session_id},
+                headers={"X-API-Key": api_key},
+            )
+        if response.status_code in (400, 401, 403, 404):
+            raise HTTPException(
+                response.status_code, "Checkout session API access denied"
+            )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        raise HTTPException(503, "Authentication service unavailable")
+
+
 SuperuserDep = Depends(get_current_superuser)
 SuperuserToken = Annotated[str, Depends(get_current_superuser)]
 InvokeDep = Depends(require_invoke)
+CheckoutSnapshotInvokeDep = Depends(require_checkout_snapshot_invoke)

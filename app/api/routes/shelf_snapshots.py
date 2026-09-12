@@ -2,7 +2,7 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from app.api.deps import InvokeDep, SuperuserDep
+from app.api.deps import CheckoutSnapshotInvokeDep, SuperuserDep
 from app.core.config import settings
 from app.core.object_storage import (
     build_object_name,
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/checkout-sessions", tags=["shelf-snapshots"])
 @router.post(
     "/{session_id}/shelf-snapshots",
     response_model=SessionSnapshotPublic,
-    dependencies=[InvokeDep],
+    dependencies=[CheckoutSnapshotInvokeDep],
 )
 async def upload_shelf_snapshot(
     session_id: str,
